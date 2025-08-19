@@ -216,7 +216,8 @@ class DNSResolver:
         for _ in range(qdcount):
             _, i = parse_name(resp, i)
             i += 4
-        answers = []
+        a_answers = []
+        aaaa_answers = []
         ancount = (resp[6] << 8) | resp[7]
         for _ in range(ancount):
             name, i = parse_name(resp, i)
@@ -227,13 +228,45 @@ class DNSResolver:
             rdata = resp[i+10:i+10+rdlength]
             i += 10 + rdlength
             if rtype == 1 and rdlength == 4:  # A record
-                answers.append('.'.join(str(b) for b in rdata))
+                a_answers.append('.'.join(str(b) for b in rdata))
             elif rtype == 28 and rdlength == 16:  # AAAA record
-                answers.append(':'.join('{:x}'.format((rdata[j]<<8)|rdata[j+1]) for j in range(0,16,2)))
+                aaaa_answers.append(':'.join('{:x}'.format((rdata[j]<<8)|rdata[j+1]) for j in range(0,16,2)))
             elif rtype == 5:  # CNAME
                 cname, _ = parse_name(resp, i - rdlength)
                 # Recursively resolve CNAME
                 return await self._resolve_upstream_ip(cname)
-        if answers:
-            return answers[0]
+        # Decide which answer to return
+        # Prefer A records for IPv4-first behavior
+        if self.disable_ipv6:
+            if a_answers:
+                return a_answers[0]
+            # try system resolver for IPv4 fallback
+            try:
+                infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+                for info in infos:
+                    addr = info[4][0]
+                    if addr:
+                        return addr
+            except Exception:
+                pass
+            # if only AAAA available and IPv6 disabled, raise
+            if aaaa_answers:
+                raise Exception("IPv6 resolution disabled and only AAAA records found for %s" % hostname)
+        else:
+            if a_answers:
+                return a_answers[0]
+            if aaaa_answers:
+                return aaaa_answers[0]
+        # fallback: try system resolver (both families)
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            for info in infos:
+                addr = info[4][0]
+                if addr:
+                    # respect disable_ipv6 flag
+                    if self.disable_ipv6 and ':' in addr:
+                        continue
+                    return addr
+        except Exception:
+            pass
         raise Exception("No A or AAAA record found in DNS response")
