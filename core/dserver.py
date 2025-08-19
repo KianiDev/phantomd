@@ -24,6 +24,8 @@ BLOCK_SUFFIX: Set[str] = set()
 BLOCK_HOSTS: Dict[str, Tuple[str]] = {}
 BLOCK_ACTION = BLOCK_ACTION_NX
 
+DISABLE_IPV6 = False
+
 
 def load_blocklists_from_dir(directory: str) -> Tuple[Set[str], Set[str], Dict[str, Tuple[str]]]:
     exact_set = set()
@@ -106,14 +108,19 @@ def _build_block_response(request_msg: dns.message.Message, action: str) -> byte
             resp.answer.append(rrset)
             return resp.to_wire()
         elif qtype == dns.rdatatype.AAAA:
+            # if IPv6 disabled, return NXDOMAIN instead
+            if DISABLE_IPV6:
+                resp.set_rcode(dns.rcode.NXDOMAIN)
+                return resp.to_wire()
             rrset = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
             resp.answer.append(rrset)
             return resp.to_wire()
         elif qtype == dns.rdatatype.ANY:
             a = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.A, '0.0.0.0')
-            aaaa = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
             resp.answer.append(a)
-            resp.answer.append(aaaa)
+            if not DISABLE_IPV6:
+                aaaa = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
+                resp.answer.append(aaaa)
             return resp.to_wire()
         # fallback NXDOMAIN for other types
         resp.set_rcode(dns.rcode.NXDOMAIN)
@@ -125,9 +132,10 @@ def _build_block_response(request_msg: dns.message.Message, action: str) -> byte
 
 
 class UDPResolverProtocol(asyncio.DatagramProtocol):
-    def __init__(self, resolver: DNSResolver):
+    def __init__(self, resolver: DNSResolver, disable_ipv6: bool = False):
         self.resolver = resolver
         self.transport = None
+        self.disable_ipv6 = disable_ipv6
 
     def connection_made(self, transport):
         self.transport = transport
@@ -139,15 +147,22 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
     async def _handle(self, data: bytes, addr):
         try:
-            # parse
             qname = None
             request_msg = None
+            qtype = None
             try:
                 request_msg = dns.message.from_wire(data)
                 if request_msg.question:
                     qname = str(request_msg.question[0].name).rstrip('.')
+                    qtype = request_msg.question[0].rdtype
             except Exception:
                 qname = None
+            # Block AAAA queries if disable_ipv6 is True
+            if self.disable_ipv6 and qtype == dns.rdatatype.AAAA:
+                resp_wire = _build_block_response(request_msg, BLOCK_ACTION_NX)
+                self.transport.sendto(resp_wire, addr)
+                logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
+                return
             if qname and _is_blocked(qname):
                 resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
                 self.transport.sendto(resp_wire, addr)
@@ -155,36 +170,62 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                 return
             # forward to resolver
             response = await self.resolver.forward_dns_query(data)
+            # If IPv6 disabled, strip AAAA records from the upstream response
+            if self.disable_ipv6:
+                try:
+                    resp_msg = dns.message.from_wire(response)
+                    resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
+                    resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
+                    response = resp_msg.to_wire()
+                except Exception:
+                    # leave original response if parsing fails
+                    pass
             self.transport.sendto(response, addr)
             logging.debug(f"Sent UDP DNS response to {addr}")
         except Exception as e:
             logging.error(f"Error handling UDP DNS query from {addr}: {e}")
 
 
-async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, resolver: DNSResolver):
+async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, resolver: DNSResolver, disable_ipv6: bool = False):
     peer = writer.get_extra_info('peername')
     logging.debug(f"Accepted TCP connection from {peer}")
     try:
         length_bytes = await reader.readexactly(2)
         length = int.from_bytes(length_bytes, 'big')
         data = await reader.readexactly(length)
-        # Check blocking before forwarding
         qname = None
         request_msg = None
+        qtype = None
         try:
             request_msg = dns.message.from_wire(data)
             if request_msg.question:
                 qname = str(request_msg.question[0].name).rstrip('.')
+                qtype = request_msg.question[0].rdtype
         except Exception:
             qname = None
+        # Block AAAA queries if disable_ipv6 is True
+        if disable_ipv6 and qtype == dns.rdatatype.AAAA:
+            resp_wire = _build_block_response(request_msg, BLOCK_ACTION_NX)
+            writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
+            await writer.drain()
+            logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
+            return
         if qname and _is_blocked(qname):
             resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
-            # send with length prefix
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
             await writer.drain()
             logging.debug(f"Blocked TCP DNS query for {qname} -> action {BLOCK_ACTION}")
             return
         response = await resolver.forward_dns_query(data)
+        # strip AAAA when disabled
+        if disable_ipv6:
+            try:
+                resp_msg = dns.message.from_wire(response)
+                resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
+                resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
+                response = resp_msg.to_wire()
+            except Exception:
+                pass
         resp_len = len(response).to_bytes(2, 'big')
         writer.write(resp_len + response)
         await writer.drain()
@@ -200,14 +241,9 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False):
-    """Start UDP and TCP DNS listeners and forward queries to DNSResolver.forward_dns_query.
-
-    This function does NOT start the resolver's internal listener; it instantiates the resolver object only
-    to reuse its forwarding logic.
-    """
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
-
-    # pass disable_ipv6 into resolver so it avoids IPv6 resolution
+    global DISABLE_IPV6
+    DISABLE_IPV6 = disable_ipv6
     resolver = DNSResolver(upstream_dns, protocol, dns_resolver_server, verbose, disable_ipv6=disable_ipv6)
 
     loop = asyncio.get_running_loop()
@@ -227,13 +263,13 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
 
     # UDP listener
     udp_transport, _ = await loop.create_datagram_endpoint(
-        lambda: UDPResolverProtocol(resolver),
+        lambda: UDPResolverProtocol(resolver, disable_ipv6=disable_ipv6),
         local_addr=(listen_ip, listen_port)
     )
     logging.info(f"DNS UDP listener running on {listen_ip}:{listen_port}")
 
     # TCP listener
-    server = await asyncio.start_server(lambda r, w: _tcp_handler(r, w, resolver), listen_ip, listen_port)
+    server = await asyncio.start_server(lambda r, w: _tcp_handler(r, w, resolver, disable_ipv6=disable_ipv6), listen_ip, listen_port)
     logging.info(f"DNS TCP listener running on {listen_ip}:{listen_port}")
 
     # Handle blocklists: perform initial fetch (wait) and schedule periodic refresh
