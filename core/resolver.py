@@ -1,5 +1,4 @@
 import asyncio
-from asyncio import DatagramProtocol
 import logging
 import socket
 from typing import Optional
@@ -11,48 +10,18 @@ try:
 except ImportError:
     aioquic = None
 
-class DNSResolver(DatagramProtocol):
-    def __init__(self, listen_ip, listen_port, upstream_dns, protocol, dns_resolver_server=None, verbose=False):
-        self.listen_ip = listen_ip
-        self.listen_port = listen_port
+class DNSResolver:
+    def __init__(self, upstream_dns, protocol, dns_resolver_server=None, verbose=False, disable_ipv6=False):
         self.upstream_dns = upstream_dns
         self.protocol = protocol.lower()
         self.dns_resolver_server = dns_resolver_server
         self.verbose = verbose
+        self.disable_ipv6 = disable_ipv6
         self.logger = logging.getLogger("DNSResolver")
         self.logger.setLevel(logging.DEBUG if verbose else logging.INFO)
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
         self.logger.addHandler(handler)
-
-    async def start(self):
-        self.logger.info(f"Starting DNS resolver on {self.listen_ip}:{self.listen_port} using {self.protocol.upper()} upstream {self.upstream_dns}")
-        loop = asyncio.get_running_loop()
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: self,
-            local_addr=(self.listen_ip, self.listen_port)
-        )
-        self.logger.info("DNS resolver is running.")
-        try:
-            await asyncio.Future()  # Run forever
-        finally:
-            transport.close()
-
-    def connection_made(self, transport):
-        self.transport = transport
-        self.logger.debug("Connection made.")
-
-    def datagram_received(self, data, addr):
-        self.logger.debug(f"Received DNS query from {addr}")
-        asyncio.create_task(self.handle_dns_query(data, addr))
-
-    async def handle_dns_query(self, data, addr):
-        try:
-            response = await self.forward_dns_query(data)
-            self.transport.sendto(response, addr)
-            self.logger.debug(f"Sent DNS response to {addr}")
-        except Exception as e:
-            self.logger.error(f"Error handling DNS query: {e}")
 
     async def forward_dns_query(self, data: bytes) -> bytes:
         if self.protocol == "udp":
@@ -69,17 +38,36 @@ class DNSResolver(DatagramProtocol):
             raise ValueError(f"Unsupported protocol: {self.protocol}")
 
     async def _forward_udp(self, data: bytes) -> bytes:
-        ip, port = self.upstream_dns.split(":")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # parse host:port (allow host names)
+        hostport = self.upstream_dns
+        if ':' in hostport and not hostport.startswith('http'):
+            host, port = hostport.rsplit(':', 1)
+        else:
+            host = hostport
+            port = 53
+        resolved_ip = await self._resolve_upstream_ip(host)
+        # select address family
+        family = socket.AF_INET6 if ':' in resolved_ip else socket.AF_INET
+        if self.disable_ipv6 and family == socket.AF_INET6:
+            raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.settimeout(2)
-        sock.sendto(data, (ip, int(port)))
-        response, _ = sock.recvfrom(4096)
+        sock.sendto(data, (resolved_ip, int(port)))
+        response, _ = sock.recvfrom(65535)
         sock.close()
         return response
 
     async def _forward_tcp(self, data: bytes) -> bytes:
-        ip, port = self.upstream_dns.split(":")
-        reader, writer = await asyncio.open_connection(ip, int(port))
+        hostport = self.upstream_dns
+        if ':' in hostport and not hostport.startswith('http'):
+            host, port = hostport.rsplit(':', 1)
+        else:
+            host = hostport
+            port = 53
+        resolved_ip = await self._resolve_upstream_ip(host)
+        if self.disable_ipv6 and ':' in resolved_ip:
+            raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
+        reader, writer = await asyncio.open_connection(resolved_ip, int(port))
         length = len(data).to_bytes(2, 'big')
         writer.write(length + data)
         await writer.drain()
@@ -90,10 +78,17 @@ class DNSResolver(DatagramProtocol):
         return response
 
     async def _forward_tls(self, data: bytes) -> bytes:
-        ip, port = self.upstream_dns.split(":")
+        hostport = self.upstream_dns
+        if ':' in hostport:
+            host, port = hostport.rsplit(':', 1)
+        else:
+            host = hostport
+            port = 853
         ssl_ctx = ssl.create_default_context()
-        resolved_ip = await self._resolve_upstream_ip(ip)
-        reader, writer = await asyncio.open_connection(resolved_ip, int(port), ssl=ssl_ctx, server_hostname=ip)
+        resolved_ip = await self._resolve_upstream_ip(host)
+        if self.disable_ipv6 and ':' in resolved_ip:
+            raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
+        reader, writer = await asyncio.open_connection(resolved_ip, int(port), ssl=ssl_ctx, server_hostname=host)
         length = len(data).to_bytes(2, 'big')
         writer.write(length + data)
         await writer.drain()
@@ -115,12 +110,17 @@ class DNSResolver(DatagramProtocol):
         from urllib.parse import urlparse
         parsed = urlparse(url)
         resolved_ip = await self._resolve_upstream_ip(parsed.hostname)
+        # If disable_ipv6 and resolved_ip is IPv6, raise
+        if self.disable_ipv6 and ':' in resolved_ip:
+            raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
         # Use original hostname in URL, set Host header, and monkeypatch getaddrinfo for custom DNS resolution
         import socket as pysocket
         orig_getaddrinfo = pysocket.getaddrinfo
         def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             if host == parsed.hostname:
-                return [(pysocket.AF_INET, pysocket.SOCK_STREAM, 6, '', (resolved_ip, port))]
+                # choose family matching resolved_ip
+                fam = pysocket.AF_INET6 if ':' in resolved_ip else pysocket.AF_INET
+                return [(fam, pysocket.SOCK_STREAM, 6, '', (resolved_ip, port))]
             return orig_getaddrinfo(host, port, family, type, proto, flags)
         pysocket.getaddrinfo = fake_getaddrinfo
         try:
@@ -138,6 +138,9 @@ class DNSResolver(DatagramProtocol):
         host, port = self.upstream_dns.split(":")
         port = int(port)
         resolved_ip = await self._resolve_upstream_ip(host)
+        # if disable_ipv6 ensure resolved_ip is IPv4
+        if self.disable_ipv6 and ':' in resolved_ip:
+            raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
         configuration = QuicConfiguration(is_client=True, alpn_protocols=["doq"], verify_mode=ssl.CERT_REQUIRED)
         from aioquic.asyncio.client import connect
         response_data = bytearray()
@@ -174,6 +177,9 @@ class DNSResolver(DatagramProtocol):
     async def _resolve_upstream_ip(self, hostname):
         # Use custom DNS server to resolve hostname
         if not self.dns_resolver_server:
+            # prefer IPv4 when disable_ipv6
+            if self.disable_ipv6:
+                return socket.gethostbyname(hostname)
             return socket.gethostbyname(hostname)
         ip, port = self.dns_resolver_server.split(":")
         import random, struct
@@ -231,7 +237,3 @@ class DNSResolver(DatagramProtocol):
         if answers:
             return answers[0]
         raise Exception("No A or AAAA record found in DNS response")
-
-def run_resolver(listen_ip, listen_port, upstream_dns, protocol, dns_resolver_server=None, verbose=False):
-    resolver = DNSResolver(listen_ip, listen_port, upstream_dns, protocol, dns_resolver_server, verbose)
-    asyncio.run(resolver.start())
