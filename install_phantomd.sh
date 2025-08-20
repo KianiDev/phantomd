@@ -59,6 +59,9 @@ pip install httpx aiohttp dnspython requests || true
 # create logs directory
 mkdir -p /var/log/phantomd
 chown root:root /var/log/phantomd
+# create var lib directory for leases
+mkdir -p /var/lib/phantomd
+chown root:root /var/lib/phantomd
 
 # Create systemd service
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
@@ -106,6 +109,17 @@ enabled = false
 urls = 
 interval_seconds = 86400
 action = NXDOMAIN
+
+[dhcp]
+enabled = false
+subnet = 192.168.1.0
+netmask = 255.255.255.0
+start_ip = 192.168.1.100
+end_ip = 192.168.1.200
+lease_ttl = 86400
+static_leases = 
+# Path to lease DB file
+dhcp_lease_db = /var/lib/phantomd/dhcp_leases.json
 EOF
 fi
 
@@ -134,6 +148,26 @@ if [ "$INPUT" = "true" ]; then
   sed -i "s/^urls =.*$/urls = $INPUT2/" "$CONFIG_FILE"
   read -r -p "Block action (ZEROIP/NXDOMAIN/REFUSED) [NXDOMAIN]: " INPUT3; INPUT3=${INPUT3:-NXDOMAIN}
   sed -i "s/^action =.*$/action = $INPUT3/" "$CONFIG_FILE"
+fi
+
+# DHCP configuration prompts (confined to [dhcp] section)
+read -r -p "Enable DHCP server? (true/false) [false]: " DHCPE; DHCPE=${DHCPE:-false}
+sed -i "/^\[dhcp\]/,/^\[/{s/^enabled =.*$/enabled = $DHCPE/}" "$CONFIG_FILE"
+if [ "$DHCPE" = "true" ]; then
+  read -r -p "DHCP subnet (network address) [192.168.1.0]: " INPUT; INPUT=${INPUT:-192.168.1.0}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^subnet =.*$/subnet = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "DHCP netmask [255.255.255.0]: " INPUT; INPUT=${INPUT:-255.255.255.0}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^netmask =.*$/netmask = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "DHCP range start [192.168.1.100]: " INPUT; INPUT=${INPUT:-192.168.1.100}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^start_ip =.*$/start_ip = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "DHCP range end [192.168.1.200]: " INPUT; INPUT=${INPUT:-192.168.1.200}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^end_ip =.*$/end_ip = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "Lease TTL seconds [86400]: " INPUT; INPUT=${INPUT:-86400}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^lease_ttl =.*$/lease_ttl = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "Static leases (mac=ip,...) []: " INPUT; INPUT=${INPUT:-}
+  sed -i "/^\[dhcp\]/,/^\[/{s/^static_leases =.*$/static_leases = $INPUT/}" "$CONFIG_FILE"
+  read -r -p "Lease DB path [/var/lib/phantomd/dhcp_leases.json]: " INPUT; INPUT=${INPUT:-/var/lib/phantomd/dhcp_leases.json}
+  sed -i "/^\[dhcp\]/,/^\[/{s%^dhcp_lease_db =.*$%dhcp_lease_db = $INPUT%}" "$CONFIG_FILE"
 fi
 
 echo "Installation complete. Start the service with: sudo systemctl start phantomd"

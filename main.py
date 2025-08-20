@@ -1,8 +1,11 @@
 from utils.config import load_config
 import argparse
 import logging
-from core.dserver import run_server_sync
+import asyncio
+from core.dserver import run_server
+from core.DHCP import DHCPServer
 from utils.ListUpdater import fetch_blocklists_sync
+
 
 def main():
     parser = argparse.ArgumentParser(description="phantomd DNS server")
@@ -31,7 +34,8 @@ def main():
         except Exception as e:
             logging.warning(f"Initial blocklist fetch failed: {e}")
 
-    run_server_sync(
+    # Prepare coroutines
+    dns_coro = run_server(
         config["listen_ip"],
         config["listen_port"],
         config["upstream_dns"],
@@ -41,6 +45,27 @@ def main():
         blocklists=block_cfg,
         disable_ipv6=config.get("disable_ipv6", False)
     )
+
+    dhcp_cfg = config.get('dhcp', {})
+    dhcp_coro = None
+    if dhcp_cfg.get('enabled'):
+        dhcp = DHCPServer(
+            subnet=dhcp_cfg.get('subnet'),
+            netmask=dhcp_cfg.get('netmask'),
+            start_ip=dhcp_cfg.get('start_ip'),
+            end_ip=dhcp_cfg.get('end_ip'),
+            lease_ttl=dhcp_cfg.get('lease_ttl'),
+            static_leases=dhcp_cfg.get('static_leases') or {},
+            server_ip=None,
+            lease_db_path=dhcp_cfg.get('lease_db_path')
+        )
+        dhcp_coro = dhcp.start()
+
+    if dhcp_coro:
+        asyncio.run(asyncio.gather(dns_coro, dhcp_coro))
+    else:
+        asyncio.run(dns_coro)
+
 
 if __name__ == "__main__":
     main()
