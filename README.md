@@ -7,15 +7,17 @@ A lightweight, modular DNS proxy with filtering and secure upstream support.
   - TCP
   - DNS-over-HTTPS (DoH)
   - DNS-over-TLS (DoT)
-  - DNS-over-QUIC (DoQ, currently in beta)
+  - DNS-over-QUIC (DoQ, currently experimental)
 - Configurable via plain `.conf` files (no heavy configs).
 - Filtering system:
   - Blocklists
-- Minimal dependencies — runs on low-resource servers (This project gets tested on a Intel Core Duo series with 3GBs of ram). 
+- Minimal dependencies — runs on low-resource servers  *(tested on an Intel Core Duo with 3 GB RAM)*
+
 
 ## 🔒 Security Notes
 - By default, phantomd only forwards DNS traffic.
-- You can use integrate it with hostapd by enabling DHCP server inside the config file.
+- You can integrate it with `hostapd` by enabling the DHCP server in the config,  allowing Phantomd to act as a network-level DNS filter. (recommended)
+
 
 ## 🛠️ Development
 - Python 3.10+ recommended.
