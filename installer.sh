@@ -4,8 +4,8 @@ set -eu
 # Fetches repository tarball, sets up virtualenv, installs deps, creates systemd service,
 # and writes config/phantomd.conf interactively.
 
-VERSION="v0.1.0"
-REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/$VERSION"
+VERSION="0.1.0"
+REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
 INSTALL_DIR="/opt/phantomd"
 VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_NAME="phantomd"
@@ -14,34 +14,27 @@ echo "phantomd installer (version $VERSION, headless)"
 
 # ensure running as root
 if [ "$(id -u)" -ne 0 ]; then
-  echo "This installer must be run as root (it will create /opt/phantomd and a systemd service)."
-  echo "Please run with sudo." 
+  echo "This installer must be run as root."
   exit 1
 fi
 
-# create install dir
 mkdir -p "$INSTALL_DIR"
 chown root:root "$INSTALL_DIR"
 
-echo "Fetching repository tarball..."
 TMP_TAR="/tmp/phantomd.tar.gz"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$REPO_URL" -o "$TMP_TAR"
-else
-  echo "curl not found. Please install curl and re-run."
-  exit 1
-fi
+echo "Fetching repository tarball..."
+curl -fsSL "$REPO_URL" -o "$TMP_TAR"
 
 echo "Extracting..."
 tar xzf "$TMP_TAR" -C /tmp
-# extracted dir will be /tmp/phantomd-master
-if [ ! -d /tmp/phantomd-$VERSION ]; then
+EXTRACTED_DIR="/tmp/phantomd-$VERSION"
+
+if [ ! -d "$EXTRACTED_DIR" ]; then
   echo "Unexpected archive layout. Please inspect /tmp"
   exit 1
 fi
 
-# copy files
-cp -a /tmp/phantomd-master/* "$INSTALL_DIR/"
+cp -a "$EXTRACTED_DIR"/* "$INSTALL_DIR/"
 rm -f "$TMP_TAR"
 
 # create venv
