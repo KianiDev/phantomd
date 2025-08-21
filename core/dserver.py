@@ -162,11 +162,19 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                 resp_wire = _build_block_response(request_msg, BLOCK_ACTION_NX)
                 self.transport.sendto(resp_wire, addr)
                 logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
+                try:
+                    self.resolver.log_dns_event('Blocked (internal)', qname, f"{addr[0]}:{addr[1]}", 'Disabled IPv6')
+                except Exception:
+                    pass
                 return
             if qname and _is_blocked(qname):
                 resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
                 self.transport.sendto(resp_wire, addr)
                 logging.debug(f"Blocked UDP DNS query for {qname} -> action {BLOCK_ACTION}")
+                try:
+                    self.resolver.log_dns_event('Blocked (internal)', qname, f"{addr[0]}:{addr[1]}", f"Action={BLOCK_ACTION}")
+                except Exception:
+                    pass
                 return
             # forward to resolver
             response = await self.resolver.forward_dns_query(data)
@@ -182,6 +190,10 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                     pass
             self.transport.sendto(response, addr)
             logging.debug(f"Sent UDP DNS response to {addr}")
+            try:
+                self.resolver.log_dns_event('Processed', qname, f"{addr[0]}:{addr[1]}")
+            except Exception:
+                pass
         except Exception as e:
             logging.error(f"Error handling UDP DNS query from {addr}: {e}")
 
@@ -209,23 +221,26 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
             await writer.drain()
             logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
+            try:
+                resolver.log_dns_event('Blocked (internal)', qname, f"{peer[0]}:{peer[1]}", 'Disabled IPv6')
+            except Exception:
+                pass
             return
         if qname and _is_blocked(qname):
             resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
             await writer.drain()
             logging.debug(f"Blocked TCP DNS query for {qname} -> action {BLOCK_ACTION}")
-            return
-        response = await resolver.forward_dns_query(data)
-        # strip AAAA when disabled
-        if disable_ipv6:
             try:
-                resp_msg = dns.message.from_wire(response)
-                resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
-                resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
-                response = resp_msg.to_wire()
+                resolver.log_dns_event('Blocked (internal)', qname, f"{peer[0]}:{peer[1]}", f"Action={BLOCK_ACTION}")
             except Exception:
                 pass
+            return
+        response = await resolver.forward_dns_query(data)
+        try:
+            resolver.log_dns_event('Processed', qname, f"{peer[0]}:{peer[1]}")
+        except Exception:
+            pass
         resp_len = len(response).to_bytes(2, 'big')
         writer.write(resp_len + response)
         await writer.drain()
@@ -240,25 +255,25 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             pass
 
 
-async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False):
-    # cache tuning values will be passed through from main
-    dns_cache_ttl = 300
-    dns_cache_max_size = 1024
-    # allow override through kwargs (backwards compatible)
-    import inspect
-    frame = inspect.currentframe()
-    # read kwargs from caller if provided
-    try:
-        caller_locals = frame.f_back.f_locals if frame and frame.f_back else {}
-        dns_cache_ttl = caller_locals.get('dns_cache_ttl', dns_cache_ttl)
-        dns_cache_max_size = caller_locals.get('dns_cache_max_size', dns_cache_max_size)
-    finally:
-        del frame
+async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False, dns_cache_ttl: int = 300, dns_cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log'):
+    # explicit cache and logging parameters are now function args (defaults provided)
 
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
     global DISABLE_IPV6
     DISABLE_IPV6 = disable_ipv6
-    resolver = DNSResolver(upstream_dns, protocol, dns_resolver_server, verbose, disable_ipv6=disable_ipv6, cache_ttl=dns_cache_ttl, cache_max_size=dns_cache_max_size)
+    resolver = DNSResolver(
+        upstream_dns,
+        protocol,
+        dns_resolver_server,
+        verbose,
+        disable_ipv6=disable_ipv6,
+        cache_ttl=dns_cache_ttl,
+        cache_max_size=dns_cache_max_size,
+        dns_logging_enabled=dns_logging_enabled,
+        dns_log_retention_days=dns_log_retention_days,
+        dns_log_dir=dns_log_dir,
+        dns_log_prefix=dns_log_prefix,
+    )
 
     loop = asyncio.get_running_loop()
 

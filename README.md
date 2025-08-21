@@ -46,15 +46,14 @@ The main configuration file is config/phantomd.conf. Important options:
 Service
 - Systemd service installed as /etc/systemd/system/phantomd.service (user provided during install).
 - Control with:
-  - sudo systemctl start phantomd
-  - sudo systemctl enable phantomd
+  - sudo systemctl (Operation) phantomd
+- Check program logs:
   - sudo journalctl -u phantomd -f
 
 Security note
 - When using DoH/DoT/DoQ ensure you trust the upstream. QUIC/HTTP/3 support depends on installed libraries and upstream compatibility.
 
 Development
-- The codebase is small and organized into core/ (resolver, server), utils/ (config, list updater), and config/.
 - If modifying code you can run it directly with the virtualenv Python created by the installer.
 
 License
@@ -62,3 +61,5 @@ License
 
 Contact
 - Repository: https://github.com/KianiDev/phantomd
+- Email: mohammadamin.k1390@gmail.com
+- Discord: kianivanced

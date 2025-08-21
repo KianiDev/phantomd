@@ -19,6 +19,12 @@ def load_config(path='config/phantomd.conf'):
     dns_cache_ttl = config.getint('upstream', 'dns_cache_ttl', fallback=300)
     dns_cache_max_size = config.getint('upstream', 'dns_cache_max_size', fallback=1024)
 
+    # DNS request logging settings (under [logging])
+    dns_logging_enabled = config.getboolean('logging', 'dns_logging_enabled', fallback=False)
+    dns_log_retention_days = config.getint('logging', 'dns_log_retention_days', fallback=7)
+    dns_log_dir = config.get('logging', 'dns_log_dir', fallback='/var/log/phantomd')
+    dns_log_prefix = config.get('logging', 'dns_log_prefix', fallback='dns-log')
+
     # DHCP settings
     dhcp_enabled = config.getboolean('dhcp', 'enabled', fallback=False)
     dhcp_subnet = config.get('dhcp', 'subnet', fallback='192.168.1.0')
@@ -46,6 +52,10 @@ def load_config(path='config/phantomd.conf'):
         "disable_ipv6": disable_ipv6,
         "dns_cache_ttl": dns_cache_ttl,
         "dns_cache_max_size": dns_cache_max_size,
+        "dns_logging_enabled": dns_logging_enabled,
+        "dns_log_retention_days": dns_log_retention_days,
+        "dns_log_dir": dns_log_dir,
+        "dns_log_prefix": dns_log_prefix,
         "dhcp": {
             "enabled": dhcp_enabled,
             "subnet": dhcp_subnet,

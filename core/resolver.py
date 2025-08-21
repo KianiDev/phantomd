@@ -11,7 +11,7 @@ except ImportError:
     aioquic = None
 
 class DNSResolver:
-    def __init__(self, upstream_dns, protocol, dns_resolver_server=None, verbose=False, disable_ipv6=False, cache_ttl: int = 300, cache_max_size: int = 1024):
+    def __init__(self, upstream_dns, protocol, dns_resolver_server=None, verbose=False, disable_ipv6=False, cache_ttl: int = 300, cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log'):
         self.upstream_dns = upstream_dns
         self.protocol = protocol.lower()
         self.dns_resolver_server = dns_resolver_server
@@ -29,6 +29,45 @@ class DNSResolver:
         except Exception:
             # Fallback to a simple dict with no TTL if cachetools is unavailable
             self._dns_cache = {}
+        # DNS request logging configuration
+        self.dns_logging_enabled = bool(dns_logging_enabled)
+        self.dns_log_retention_days = int(dns_log_retention_days) if dns_logging_enabled else 0
+        self.dns_log_dir = dns_log_dir
+        self.dns_log_prefix = dns_log_prefix
+        self._file_logger = None
+        if self.dns_logging_enabled:
+            try:
+                import os, datetime
+                os.makedirs(self.dns_log_dir, exist_ok=True)
+                today = datetime.date.today().strftime('%Y-%m-%d')
+                logfile = os.path.join(self.dns_log_dir, f"{self.dns_log_prefix}-{today}.log")
+                file_logger = logging.getLogger(f"DNS_REQUEST_LOGGER")
+                file_logger.setLevel(logging.INFO)
+                # avoid adding multiple handlers if re-init
+                if not any(isinstance(h, logging.FileHandler) and h.baseFilename == logfile for h in file_logger.handlers):
+                    fh = logging.FileHandler(logfile, mode='a')
+                    fh.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+                    file_logger.addHandler(fh)
+                self._file_logger = file_logger
+                # cleanup old logs
+                try:
+                    cutoff = datetime.datetime.now() - datetime.timedelta(days=self.dns_log_retention_days)
+                    for fname in os.listdir(self.dns_log_dir):
+                        if not fname.startswith(self.dns_log_prefix):
+                            continue
+                        fpath = os.path.join(self.dns_log_dir, fname)
+                        try:
+                            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+                            if mtime < cutoff:
+                                os.remove(fpath)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                # fail quietly and keep file logging disabled
+                self.dns_logging_enabled = False
+                self._file_logger = None
 
     async def forward_dns_query(self, data: bytes) -> bytes:
         if self.protocol == "udp":
@@ -347,3 +386,24 @@ class DNSResolver:
                 pass
             return selected
         raise Exception("No A or AAAA record found in DNS response")
+
+    def log_dns_event(self, status: str, qname: Optional[str], client_addr: Optional[str], details: Optional[str] = None):
+        """Log DNS request event to configured file logger (if enabled).
+        status: one of 'Processed', 'Blocked (provider)', 'Blocked (internal)'
+        qname: queried domain
+        client_addr: client ip:port or peer identifier
+        details: optional additional information
+        """
+        entry = f"{status}\tqname={qname}\tclient={client_addr}"
+        if details:
+            entry += f"\t{details}"
+        # console logger as well
+        if status.startswith('Blocked'):
+            self.logger.info(entry)
+        else:
+            self.logger.debug(entry)
+        if self.dns_logging_enabled and self._file_logger:
+            try:
+                self._file_logger.info(entry)
+            except Exception:
+                pass

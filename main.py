@@ -6,7 +6,6 @@ from core.dserver import run_server
 from core.DHCP import DHCPServer
 from utils.ListUpdater import fetch_blocklists_sync
 
-
 def main():
     parser = argparse.ArgumentParser(description="phantomd DNS server")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -45,7 +44,11 @@ def main():
         blocklists=block_cfg,
         disable_ipv6=config.get("disable_ipv6", False),
         dns_cache_ttl=config.get("dns_cache_ttl", 300),
-        dns_cache_max_size=config.get("dns_cache_max_size", 1024)
+        dns_cache_max_size=config.get("dns_cache_max_size", 1024),
+        dns_logging_enabled=config.get("dns_logging_enabled", False),
+        dns_log_retention_days=config.get("dns_log_retention_days", 7),
+        dns_log_dir=config.get("dns_log_dir", "/var/log/phantomd"),
+        dns_log_prefix=config.get("dns_log_prefix", "dns-log")
     )
 
     dhcp_cfg = config.get('dhcp', {})
