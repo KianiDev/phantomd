@@ -1,65 +1,34 @@
-phantomd
-========
+# phantomd 🕶️
+A lightweight, modular DNS proxy with filtering and secure upstream support.
 
-A small, configurable local DNS server and forwarder with optional blocklist enforcement.
+## ✨ Features
+- Supports multiple DNS protocols:
+  - UDP
+  - TCP
+  - DNS-over-HTTPS (DoH)
+  - DNS-over-TLS (DoT)
+  - DNS-over-QUIC (DoQ, currently in beta)
+- Configurable via plain `.conf` files (no heavy configs).
+- Filtering system:
+  - Blocklists
+- Minimal dependencies — runs on low-resource servers (This project gets tested on a Intel Core Duo series with 3GBs of ram). 
 
-Features
-- Listens on UDP/TCP (port configurable).
-- Forwards upstream using UDP/TCP/TLS/HTTPS/QUIC (configurable).
-- Optional blocklist fetching and enforcement (hosts-format supported).
-- Configurable blocking actions: ZEROIP, NXDOMAIN, REFUSED.
-- Optional ability to disable IPv6 lookups for better IPv4-only blocklists.
+## 🔒 Security Notes
+- By default, phantomd only forwards DNS traffic.
+- You can use integrate it with hostapd by enabling DHCP server inside the config file.
 
-Quick install (recommended)
-1. Run the bundled installer (headless interactive):
-   sudo sh install_phantomd.sh
+## 🛠️ Development
+- Python 3.10+ recommended.
+- Built with `asyncio` for concurrency.
 
-Prerequisites
-- Linux systemd-based distribution
-- curl, tar, python3 (>=3.8), python3-venv
+## 🗺️ Roadmap
+- [ ] Full DoQ support
+- [ ] Config reloading without restart
+- [ ] Optional web dashboard
+- [ ] Preventing DNS leaking at network level
 
-Installer
-- The installer automates fetching the repository tarball, creating a virtualenv, installing Python dependencies, creating a systemd service, and generating a configuration file.
-- The installer is headless (CLI prompts only) and guides you through config options.
+## 🤝 Contributing
+Pull requests are welcome! For major changes, open an issue first to discuss what you would like to change.
 
-Configuration
-The main configuration file is config/phantomd.conf. Important options:
-- [upstream]
-  - dns_server: Upstream DNS server (IP or host). Examples: 1.1.1.1, 9.9.9.9:853, https://dns.example/dns-query
-  - dns_protocol: upstream protocol to use (udp, tcp, tls, https, quic)
-  - disable_ipv6: true/false. When true the resolver will avoid IPv6 resolution and connections.
-
-- [interface]
-  - listen_ip: IP address to bind locally (default 0.0.0.0)
-  - listen_port: port to bind locally (default 53)
-
-- [logging]
-  - verbose: true/false (enable debug logging)
-  - dns_resolver_server: optional local resolver (ip:port) used to resolve upstream hostnames for DoH/DoT/DoQ
-
-- [blocklists]
-  - enabled: true/false
-  - urls: comma-separated remote URLs or local file paths to fetch into ./blocklists
-  - interval_seconds: how often to refresh the lists
-  - action: ZEROIP | NXDOMAIN | REFUSED
-
-Service
-- Systemd service installed as /etc/systemd/system/phantomd.service (user provided during install).
-- Control with:
-  - sudo systemctl (Operation) phantomd
-- Check program logs:
-  - sudo journalctl -u phantomd -f
-
-Security note
-- When using DoH/DoT/DoQ ensure you trust the upstream. QUIC/HTTP/3 support depends on installed libraries and upstream compatibility.
-
-Development
-- If modifying code you can run it directly with the virtualenv Python created by the installer.
-
-License
-- Check repository LICENSE before redistribution.
-
-Contact
-- Repository: https://github.com/KianiDev/phantomd
-- Email: mohammadamin.k1390@gmail.com
-- Discord: kianivanced
+## 📜 License
+MIT License — free to use, modify, and share.

@@ -1,7 +1,6 @@
 #!/usr/bin/env sh
 set -eu
 
-# phantomd installer (headless interactive)
 # Fetches repository tarball, sets up virtualenv, installs deps, creates systemd service,
 # and writes config/phantomd.conf interactively.
 
@@ -54,7 +53,7 @@ python3 -m venv "$VENV_DIR"
 echo "Upgrading pip and installing python dependencies..."
 # Best-effort install dependencies
 pip install --upgrade pip
-pip install httpx aiohttp dnspython requests cachetools || true
+pip install httpx aiohttp dnspython requests cachetools aioquic httpx[http3] || true
 
 # create logs directory
 mkdir -p /var/log/phantomd
