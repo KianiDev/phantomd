@@ -43,7 +43,9 @@ def main():
         dns_resolver_server=config.get("dns_resolver_server"),
         verbose=verbose,
         blocklists=block_cfg,
-        disable_ipv6=config.get("disable_ipv6", False)
+        disable_ipv6=config.get("disable_ipv6", False),
+        dns_cache_ttl=config.get("dns_cache_ttl", 300),
+        dns_cache_max_size=config.get("dns_cache_max_size", 1024)
     )
 
     dhcp_cfg = config.get('dhcp', {})

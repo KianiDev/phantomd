@@ -54,7 +54,7 @@ python3 -m venv "$VENV_DIR"
 echo "Upgrading pip and installing python dependencies..."
 # Best-effort install dependencies
 pip install --upgrade pip
-pip install httpx aiohttp dnspython requests || true
+pip install httpx aiohttp dnspython requests cachetools || true
 
 # create logs directory
 mkdir -p /var/log/phantomd
@@ -94,6 +94,10 @@ if [ ! -f "$CONFIG_FILE" ]; then
 dns_server = 1.1.1.1
 dns_protocol = udp # Supported: udp, tcp, tls, https, quic
 disable_ipv6 = false
+# DNS hostname resolve cache (seconds)
+dns_cache_ttl = 300
+# Max entries in DNS hostname cache
+dns_cache_max_size = 1024
 
 [interface]
 listen_ip = 0.0.0.0
@@ -141,6 +145,10 @@ read -r -p "Verbose logging? (true/false) [false]: " INPUT; INPUT=${INPUT:-false
 sed -i "s/^verbose =.*$/verbose = $INPUT/" "$CONFIG_FILE"
 read -r -p "DNS resolver server for upstream hostname resolution (ip:port) [1.1.1.1:53]: " INPUT; INPUT=${INPUT:-1.1.1.1:53}
 sed -i "s/^dns_resolver_server =.*$/dns_resolver_server = $INPUT/" "$CONFIG_FILE"
+read -r -p "DNS cache TTL seconds [300]: " INPUT; INPUT=${INPUT:-300}
+sed -i "s/^dns_cache_ttl =.*$/dns_cache_ttl = $INPUT/" "$CONFIG_FILE"
+read -r -p "DNS cache max size [1024]: " INPUT; INPUT=${INPUT:-1024}
+sed -i "s/^dns_cache_max_size =.*$/dns_cache_max_size = $INPUT/" "$CONFIG_FILE"
 read -r -p "Enable blocklists? (true/false) [false]: " INPUT; INPUT=${INPUT:-false}
 sed -i "s/^enabled =.*$/enabled = $INPUT/" "$CONFIG_FILE"
 if [ "$INPUT" = "true" ]; then

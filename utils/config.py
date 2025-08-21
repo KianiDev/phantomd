@@ -15,6 +15,9 @@ def load_config(path='config/phantomd.conf'):
     urls_list = [u.strip() for u in block_urls.split(',') if u.strip()]
     # read disable ipv6 option under upstream
     disable_ipv6 = config.getboolean('upstream', 'disable_ipv6', fallback=False)
+    # DNS cache settings
+    dns_cache_ttl = config.getint('upstream', 'dns_cache_ttl', fallback=300)
+    dns_cache_max_size = config.getint('upstream', 'dns_cache_max_size', fallback=1024)
 
     # DHCP settings
     dhcp_enabled = config.getboolean('dhcp', 'enabled', fallback=False)
@@ -41,6 +44,8 @@ def load_config(path='config/phantomd.conf'):
         "verbose": config.getboolean("logging", "verbose", fallback=False),
         "dns_resolver_server": config.get("logging", "dns_resolver_server", fallback="1.1.1.1:53"),
         "disable_ipv6": disable_ipv6,
+        "dns_cache_ttl": dns_cache_ttl,
+        "dns_cache_max_size": dns_cache_max_size,
         "dhcp": {
             "enabled": dhcp_enabled,
             "subnet": dhcp_subnet,

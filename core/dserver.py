@@ -241,10 +241,24 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False):
+    # cache tuning values will be passed through from main
+    dns_cache_ttl = 300
+    dns_cache_max_size = 1024
+    # allow override through kwargs (backwards compatible)
+    import inspect
+    frame = inspect.currentframe()
+    # read kwargs from caller if provided
+    try:
+        caller_locals = frame.f_back.f_locals if frame and frame.f_back else {}
+        dns_cache_ttl = caller_locals.get('dns_cache_ttl', dns_cache_ttl)
+        dns_cache_max_size = caller_locals.get('dns_cache_max_size', dns_cache_max_size)
+    finally:
+        del frame
+
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
     global DISABLE_IPV6
     DISABLE_IPV6 = disable_ipv6
-    resolver = DNSResolver(upstream_dns, protocol, dns_resolver_server, verbose, disable_ipv6=disable_ipv6)
+    resolver = DNSResolver(upstream_dns, protocol, dns_resolver_server, verbose, disable_ipv6=disable_ipv6, cache_ttl=dns_cache_ttl, cache_max_size=dns_cache_max_size)
 
     loop = asyncio.get_running_loop()
 

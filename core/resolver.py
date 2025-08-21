@@ -11,7 +11,7 @@ except ImportError:
     aioquic = None
 
 class DNSResolver:
-    def __init__(self, upstream_dns, protocol, dns_resolver_server=None, verbose=False, disable_ipv6=False):
+    def __init__(self, upstream_dns, protocol, dns_resolver_server=None, verbose=False, disable_ipv6=False, cache_ttl: int = 300, cache_max_size: int = 1024):
         self.upstream_dns = upstream_dns
         self.protocol = protocol.lower()
         self.dns_resolver_server = dns_resolver_server
@@ -22,6 +22,13 @@ class DNSResolver:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
         self.logger.addHandler(handler)
+        # DNS hostname cache (TTL-configurable)
+        try:
+            from cachetools import TTLCache
+            self._dns_cache = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+        except Exception:
+            # Fallback to a simple dict with no TTL if cachetools is unavailable
+            self._dns_cache = {}
 
     async def forward_dns_query(self, data: bytes) -> bytes:
         if self.protocol == "udp":
@@ -50,12 +57,38 @@ class DNSResolver:
         family = socket.AF_INET6 if ':' in resolved_ip else socket.AF_INET
         if self.disable_ipv6 and family == socket.AF_INET6:
             raise Exception("IPv6 resolution disabled but upstream resolved to IPv6")
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        sock.settimeout(2)
-        sock.sendto(data, (resolved_ip, int(port)))
-        response, _ = sock.recvfrom(65535)
-        sock.close()
-        return response
+        loop = asyncio.get_running_loop()
+        # Use an asyncio DatagramProtocol so UDP I/O doesn't block the event loop
+        class _ClientProtocol(asyncio.DatagramProtocol):
+            def __init__(self):
+                self.transport = None
+                # future that will be set when a response arrives or an error occurs
+                self.on_response = loop.create_future()
+            def connection_made(self, transport):
+                self.transport = transport
+                try:
+                    # send immediately to the connected remote
+                    self.transport.sendto(data)
+                except Exception as e:
+                    if not self.on_response.done():
+                        self.on_response.set_exception(e)
+            def datagram_received(self, data_bytes, addr):
+                if not self.on_response.done():
+                    self.on_response.set_result(data_bytes)
+            def error_received(self, exc):
+                if not self.on_response.done():
+                    self.on_response.set_exception(exc)
+            def connection_lost(self, exc):
+                if exc and not self.on_response.done():
+                    self.on_response.set_exception(exc)
+        protocol = _ClientProtocol()
+        # create a connected datagram endpoint to the resolved upstream
+        transport, _ = await loop.create_datagram_endpoint(lambda: protocol, remote_addr=(resolved_ip, int(port)), family=family)
+        try:
+            resp = await asyncio.wait_for(protocol.on_response, timeout=2)
+            return resp
+        finally:
+            transport.close()
 
     async def _forward_tcp(self, data: bytes) -> bytes:
         hostport = self.upstream_dns
@@ -175,12 +208,41 @@ class DNSResolver:
 
 
     async def _resolve_upstream_ip(self, hostname):
+        # basic caching: key includes disable_ipv6 to avoid returning an IPv6 address when IPv6 is disabled
+        key = (hostname, bool(self.disable_ipv6))
+        try:
+            cached = self._dns_cache.get(key)
+        except Exception:
+            cached = None
+        if cached:
+            return cached
+
+        selected = None
         # Use custom DNS server to resolve hostname
         if not self.dns_resolver_server:
             # prefer IPv4 when disable_ipv6
-            if self.disable_ipv6:
-                return socket.gethostbyname(hostname)
-            return socket.gethostbyname(hostname)
+            try:
+                if self.disable_ipv6:
+                    selected = socket.gethostbyname(hostname)
+                else:
+                    # try to return any address (v4 or v6)
+                    infos = socket.getaddrinfo(hostname, None)
+                    for info in infos:
+                        addr = info[4][0]
+                        if addr:
+                            if self.disable_ipv6 and ':' in addr:
+                                continue
+                            selected = addr
+                            break
+            except Exception:
+                selected = None
+            if selected:
+                try:
+                    self._dns_cache[key] = selected
+                except Exception:
+                    pass
+                return selected
+        # fall back to querying configured DNS resolver server
         ip, port = self.dns_resolver_server.split(":")
         import random, struct
         tid = random.randint(0, 65535)
@@ -234,39 +296,54 @@ class DNSResolver:
             elif rtype == 5:  # CNAME
                 cname, _ = parse_name(resp, i - rdlength)
                 # Recursively resolve CNAME
-                return await self._resolve_upstream_ip(cname)
+                selected = await self._resolve_upstream_ip(cname)
+                # cache and return
+                try:
+                    self._dns_cache[key] = selected
+                except Exception:
+                    pass
+                return selected
         # Decide which answer to return
         # Prefer A records for IPv4-first behavior
         if self.disable_ipv6:
             if a_answers:
-                return a_answers[0]
-            # try system resolver for IPv4 fallback
+                selected = a_answers[0]
+            else:
+                # try system resolver for IPv4 fallback
+                try:
+                    infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+                    for info in infos:
+                        addr = info[4][0]
+                        if addr:
+                            selected = addr
+                            break
+                except Exception:
+                    pass
+                # if only AAAA available and IPv6 disabled, raise
+                if not selected and aaaa_answers:
+                    raise Exception("IPv6 resolution disabled and only AAAA records found for %s" % hostname)
+        else:
+            if a_answers:
+                selected = a_answers[0]
+            elif aaaa_answers:
+                selected = aaaa_answers[0]
+        # fallback: try system resolver (both families)
+        if not selected:
             try:
-                infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+                infos = socket.getaddrinfo(hostname, None)
                 for info in infos:
                     addr = info[4][0]
                     if addr:
-                        return addr
+                        if self.disable_ipv6 and ':' in addr:
+                            continue
+                        selected = addr
+                        break
             except Exception:
                 pass
-            # if only AAAA available and IPv6 disabled, raise
-            if aaaa_answers:
-                raise Exception("IPv6 resolution disabled and only AAAA records found for %s" % hostname)
-        else:
-            if a_answers:
-                return a_answers[0]
-            if aaaa_answers:
-                return aaaa_answers[0]
-        # fallback: try system resolver (both families)
-        try:
-            infos = socket.getaddrinfo(hostname, None)
-            for info in infos:
-                addr = info[4][0]
-                if addr:
-                    # respect disable_ipv6 flag
-                    if self.disable_ipv6 and ':' in addr:
-                        continue
-                    return addr
-        except Exception:
-            pass
+        if selected:
+            try:
+                self._dns_cache[key] = selected
+            except Exception:
+                pass
+            return selected
         raise Exception("No A or AAAA record found in DNS response")
