@@ -43,6 +43,32 @@ def int_to_ip(i: int) -> str:
 
 
 class DHCPServer:
+    def get_primary_ip(self) -> Optional[str]:
+        """Return the primary IPv4 address of the host or None if it cannot be determined.
+        Tries a UDP socket to a public IP to read the local socket name (no packets sent).
+        Falls back to gethostbyname(gethostname())."""
+        try:
+            # Use UDP socket to infer outbound interface IP (no data is sent).
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Connect to a public DNS server; doesn't send packets but assigns local addr
+                s.connect(('8.8.8.8', 53))
+                ip = s.getsockname()[0]
+                return ip
+            finally:
+                s.close()
+        except Exception:
+            pass
+        try:
+            # Fallback: hostname resolution
+            hn = socket.gethostname()
+            ip = socket.gethostbyname(hn)
+            if ip and not ip.startswith('127.'):
+                return ip
+        except Exception:
+            pass
+        return None
+
     def __init__(self, subnet: str, netmask: str, start_ip: str, end_ip: str, lease_ttl: int = 86400, static_leases: Dict[str, str] = None, server_ip: Optional[str] = None, lease_db_path: Optional[str] = '/var/lib/phantomd/dhcp_leases.json'):
         self.subnet = subnet
         self.netmask = netmask
