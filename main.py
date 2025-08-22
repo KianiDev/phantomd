@@ -66,10 +66,13 @@ def main():
         )
         dhcp_coro = dhcp.start()
 
-    if dhcp_coro:
-        asyncio.run(asyncio.gather(dns_coro, dhcp_coro))
-    else:
-        asyncio.run(dns_coro)
+    async def _run_all():
+        if dhcp_coro:
+            await asyncio.gather(dns_coro, dhcp_coro)
+        else:
+            await dns_coro
+
+    asyncio.run(_run_all())
 
 
 if __name__ == "__main__":
