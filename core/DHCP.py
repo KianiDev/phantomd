@@ -80,7 +80,8 @@ class DHCPServer:
         self.leases: Dict[str, Tuple[str, float]] = {}  # mac -> (ip, expiry)
         self.pool_start = ip_to_int(start_ip)
         self.pool_end = ip_to_int(end_ip)
-        self.loop = asyncio.get_running_loop()
+        # don't grab the event loop in __init__; start() will set it when the loop is running
+        self.loop = None
         self.transport = None
         self.lease_db_path = lease_db_path
         # load persisted leases if available
@@ -269,9 +270,10 @@ class DHCPServer:
 
     async def start(self, bind_ip: str = '0.0.0.0', bind_port: int = 67):
         loop = asyncio.get_running_loop()
+        self.loop = loop
         transport, protocol = await loop.create_datagram_endpoint(lambda: DHCPProtocol(self), local_addr=(bind_ip, bind_port))
         self.transport = transport
-        # start maintenance task
+        # start maintenance task on the running loop
         self.loop.create_task(self._maintenance_loop())
         try:
             while True:
