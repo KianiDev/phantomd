@@ -47,7 +47,7 @@ python3 -m venv "$VENV_DIR"
 echo "Upgrading pip and installing python dependencies..."
 # Best-effort install dependencies
 pip install --upgrade pip
-pip install httpx aiohttp dnspython requests cachetools aioquic httpx[http3] || true
+pip install httpx aiohttp dnspython requests cachetools aioquic h3 aiosqlite || true
 
 # create logs directory
 mkdir -p /var/log/phantomd
