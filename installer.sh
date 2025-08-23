@@ -44,10 +44,12 @@ fi
 python3 -m venv "$VENV_DIR"
 . "$VENV_DIR/bin/activate"
 
-echo "Upgrading pip and installing python dependencies..."
+echo "Upgrading pip and installing dependencies..."
 # Best-effort install dependencies
 pip install --upgrade pip
-pip install httpx aiohttp dnspython requests cachetools aioquic h3 aiosqlite || true
+pip install httpx aiohttp dnspython requests cachetools aioquic h3 aiosqlite cryptography prometheus_client uvloop pytest hypothesis boofuzz aioratelimit || true
+sudo apt install iputils-arping -y || true
+sudo apt install libcap2-bin -y || true
 
 # create logs directory
 mkdir -p /var/log/phantomd

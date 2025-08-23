@@ -48,7 +48,12 @@ def main():
         dns_logging_enabled=config.get("dns_logging_enabled", False),
         dns_log_retention_days=config.get("dns_log_retention_days", 7),
         dns_log_dir=config.get("dns_log_dir", "/var/log/phantomd"),
-        dns_log_prefix=config.get("dns_log_prefix", "dns-log")
+        dns_log_prefix=config.get("dns_log_prefix", "dns-log"),
+        dns_pinned_certs=config.get("dns_pinned_certs"),
+        dnssec_enabled=config.get("dnssec_enabled", False),
+        trust_anchors_file=config.get("trust_anchors_file"),
+        metrics_enabled=config.get("metrics_enabled", False),
+        uvloop_enable=config.get("uvloop_enable", False),
     )
 
     dhcp_cfg = config.get('dhcp', {})

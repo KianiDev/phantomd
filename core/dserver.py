@@ -255,24 +255,28 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             pass
 
 
-async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False, dns_cache_ttl: int = 300, dns_cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log'):
+async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False, dns_cache_ttl: int = 300, dns_cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log', dns_pinned_certs: dict = None, dnssec_enabled: bool = False, trust_anchors_file: str = None, metrics_enabled: bool = False, uvloop_enable: bool = False):
     # explicit cache and logging parameters are now function args (defaults provided)
 
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
     global DISABLE_IPV6
     DISABLE_IPV6 = disable_ipv6
     resolver = DNSResolver(
-        upstream_dns,
-        protocol,
-        dns_resolver_server,
-        verbose,
+        upstream_dns=upstream_dns,
+        protocol=protocol,
+        dns_resolver_server=dns_resolver_server,
+        verbose=verbose,
         disable_ipv6=disable_ipv6,
         cache_ttl=dns_cache_ttl,
         cache_max_size=dns_cache_max_size,
         dns_logging_enabled=dns_logging_enabled,
-        dns_log_retention_days=dns_log_retention_days,
         dns_log_dir=dns_log_dir,
-        dns_log_prefix=dns_log_prefix,
+        # optional features - enable via configuration if desired
+        pinned_certs=dns_pinned_certs,
+        dnssec_enabled=dnssec_enabled,
+        trust_anchors=None if not trust_anchors_file else {'file': trust_anchors_file},
+        metrics_enabled=metrics_enabled,
+        uvloop_enable=uvloop_enable,
     )
 
     loop = asyncio.get_running_loop()
