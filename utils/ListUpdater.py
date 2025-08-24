@@ -1,8 +1,10 @@
 import os
+import sys
 import requests
-from urllib.parse import urlparse
-import asyncio
 import aiohttp
+import asyncio
+
+from urllib.parse import urlparse
 
 
 def _write_text(dest_path, text):
@@ -71,6 +73,7 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
                         text = await resp.text()
                         _write_text(dest_path, text)
                         results.append((raw, True))
+
                 except Exception as e:
                     print(f"Failed to fetch {raw}: {e}")
                     results.append((raw, False))
@@ -81,7 +84,7 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
                             fw.write(fr.read())
                         results.append((raw, True))
                     except Exception as e:
-                        print(f"Failed to copy {raw}: {e}")
+                        print(f"Failed to copy local blocklist {raw}: {e}")
                         results.append((raw, False))
                 else:
                     results.append((raw, False))
@@ -104,6 +107,5 @@ def start_periodic_fetch_in_background(urls, interval_seconds=86400, destination
 
 if __name__ == '__main__':
     # quick test
-    import sys
     urls = sys.argv[1:] if len(sys.argv) > 1 else []
     asyncio.run(fetch_blocklists(urls))

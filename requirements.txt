@@ -1,0 +1,31 @@
+# phantomd runtime and optional dependencies
+# Core runtime
+dnspython>=2.3.0
+cachetools>=5.0.0
+aiosqlite>=0.18.0
+prometheus_client>=0.16.0
+cryptography>=40.0.0
+
+# Async networking
+httpx>=0.24.0
+aiohttp>=3.8.4
+uvloop>=0.17.0
+
+# QUIC / DoQ
+aioquic>=0.10.0
+h3>=0.13.0
+
+# Utilities
+requests>=2.31.0
+
+# Optional helpers and rate limiting
+aioratelimit>=1.0.0
+
+# Testing / fuzzing / dev
+pytest>=7.4.0
+hypothesis>=6.0.0
+boofuzz>=0.3.0
+
+# Notes:
+# - Some packages (cryptography, aioquic, boofuzz) may require system build deps (libssl-dev, rustc, cargo).
+# - Installer will attempt to install system packages when apt is available to support wheel builds.

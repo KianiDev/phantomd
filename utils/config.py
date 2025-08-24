@@ -1,10 +1,33 @@
-import configparser
 import os
+import configparser
+
 
 def load_config(path='config/phantomd.conf'):
     config = configparser.ConfigParser()
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Configuration file not found: {path}")
+        # return defaults if config missing
+        return {
+            'verbose': False,
+            'listen_ip': '0.0.0.0',
+            'listen_port': 53,
+            'upstream_dns': '1.1.1.1',
+            'protocol': 'udp',
+            'dns_resolver_server': '1.1.1.1:53',
+            'disable_ipv6': False,
+            'blocklists': {'enabled': False, 'urls': [], 'interval_seconds': 86400, 'action': 'NXDOMAIN'},
+            'dhcp': {'enabled': False},
+            'dns_cache_ttl': 300,
+            'dns_cache_max_size': 1024,
+            'dns_logging_enabled': False,
+            'dns_log_retention_days': 7,
+            'dns_log_dir': '/var/log/phantomd',
+            'dns_log_prefix': 'dns-log',
+            'dns_pinned_certs': None,
+            'dnssec_enabled': False,
+            'trust_anchors_file': None,
+            'metrics_enabled': False,
+            'uvloop_enable': False,
+        }
     config.read(path)
     # read blocklists section
     block_enabled = config.getboolean('blocklists', 'enabled', fallback=False)
@@ -36,11 +59,13 @@ def load_config(path='config/phantomd.conf'):
     # parse static leases in format mac=ip,mac=ip
     static_leases = {}
     for item in [s.strip() for s in dhcp_static.split(',') if s.strip()]:
-        if '=' in item:
+        try:
             mac, ip = item.split('=', 1)
             static_leases[mac.strip().lower()] = ip.strip()
-    # lease DB path
-    dhcp_lease_db = config.get('dhcp', 'lease_db_path', fallback='/var/lib/phantomd/dhcp_leases.json')
+        except Exception:
+            continue
+    # lease DB path - normalize key used across codebase
+    dhcp_lease_db = config.get('dhcp', 'dhcp_lease_db', fallback='/var/lib/phantomd/dhcp_leases.json')
 
     # Security and advanced options
     dns_resolver_server = config.get('upstream', 'dns_resolver_server', fallback='1.1.1.1:53')
@@ -50,47 +75,35 @@ def load_config(path='config/phantomd.conf'):
     pinned_raw = config.get('upstream', 'pinned_certs', fallback='')
     pinned_dict = {}
     for item in [s.strip() for s in pinned_raw.split(',') if s.strip()]:
-        if '=' in item:
+        try:
             host, fp = item.split('=', 1)
             pinned_dict[host.strip()] = fp.strip()
+        except Exception:
+            continue
 
     # monitoring & perf
     metrics_enabled = config.getboolean('monitoring', 'metrics_enabled', fallback=False)
     uvloop_enable = config.getboolean('performance', 'uvloop_enable', fallback=False)
 
     return {
-        "upstream_dns": config.get("upstream", "dns_server", fallback="1.1.1.1"),
-        "protocol": config.get("upstream", "dns_protocol", fallback="udp"),
-        "listen_ip": config.get("interface", "listen_ip", fallback="0.0.0.0"),
-        "listen_port": config.getint("interface", "listen_port", fallback=53),
-        "verbose": config.getboolean("logging", "verbose", fallback=False),
-        "dns_resolver_server": dns_resolver_server,
-        "disable_ipv6": disable_ipv6,
-        "dns_cache_ttl": dns_cache_ttl,
-        "dns_cache_max_size": dns_cache_max_size,
-        "dns_logging_enabled": dns_logging_enabled,
-        "dns_log_retention_days": dns_log_retention_days,
-        "dns_log_dir": dns_log_dir,
-        "dns_log_prefix": dns_log_prefix,
-        "dns_pinned_certs": pinned_dict,
-        "dnssec_enabled": dnssec_enabled,
-        "trust_anchors_file": trust_anchors_file,
-        "metrics_enabled": metrics_enabled,
-        "uvloop_enable": uvloop_enable,
-        "dhcp": {
-            "enabled": dhcp_enabled,
-            "subnet": dhcp_subnet,
-            "netmask": dhcp_netmask,
-            "start_ip": dhcp_start,
-            "end_ip": dhcp_end,
-            "lease_ttl": dhcp_lease_ttl,
-            "static_leases": static_leases,
-            "lease_db_path": dhcp_lease_db
-        },
-        "blocklists": {
-            "enabled": block_enabled,
-            "urls": urls_list,
-            "interval_seconds": block_interval,
-            "action": block_action
-        }
+        'verbose': config.getboolean('logging', 'verbose', fallback=False),
+        'listen_ip': config.get('interface', 'listen_ip', fallback='0.0.0.0'),
+        'listen_port': config.getint('interface', 'listen_port', fallback=53),
+        'upstream_dns': config.get('upstream', 'dns_server', fallback='1.1.1.1'),
+        'protocol': config.get('upstream', 'dns_protocol', fallback='udp'),
+        'dns_resolver_server': dns_resolver_server,
+        'disable_ipv6': disable_ipv6,
+        'blocklists': {'enabled': block_enabled, 'urls': urls_list, 'interval_seconds': block_interval, 'action': block_action},
+        'dhcp': {'enabled': dhcp_enabled, 'subnet': dhcp_subnet, 'netmask': dhcp_netmask, 'start_ip': dhcp_start, 'end_ip': dhcp_end, 'lease_ttl': dhcp_lease_ttl, 'static_leases': static_leases, 'lease_db_path': dhcp_lease_db},
+        'dns_cache_ttl': dns_cache_ttl,
+        'dns_cache_max_size': dns_cache_max_size,
+        'dns_logging_enabled': dns_logging_enabled,
+        'dns_log_retention_days': dns_log_retention_days,
+        'dns_log_dir': dns_log_dir,
+        'dns_log_prefix': dns_log_prefix,
+        'dns_pinned_certs': pinned_dict,
+        'dnssec_enabled': dnssec_enabled,
+        'trust_anchors_file': trust_anchors_file,
+        'metrics_enabled': metrics_enabled,
+        'uvloop_enable': uvloop_enable,
     }

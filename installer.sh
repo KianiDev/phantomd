@@ -44,12 +44,43 @@ fi
 python3 -m venv "$VENV_DIR"
 . "$VENV_DIR/bin/activate"
 
-echo "Upgrading pip and installing dependencies..."
-# Best-effort install dependencies
+echo "Upgrading pip and installing dependencies from requirements.txt..."
+# Best-effort install dependencies from bundled requirements.txt
 pip install --upgrade pip
-pip install httpx aiohttp dnspython requests cachetools aioquic h3 aiosqlite cryptography prometheus_client uvloop pytest hypothesis boofuzz aioratelimit || true
-sudo apt install iputils-arping -y || true
-sudo apt install libcap2-bin -y || true
+if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+  pip install -r "$INSTALL_DIR/requirements.txt" || true
+else
+  pip install --upgrade pip
+  pip install httpx aiohttp dnspython requests cachetools aioquic aiosqlite cryptography prometheus_client uvloop pytest hypothesis boofuzz aioratelimit || true
+fi
+
+# try to install some OS-level helper packages if apt is available
+if command -v apt >/dev/null 2>&1; then
+  echo "Installing system packages via apt..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || true
+  apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-venv \
+    python3-dev \
+    libssl-dev \
+    libffi-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev \
+    pkg-config \
+    ca-certificates \
+    wget \
+    curl \
+    iputils-arping \
+    libcap2-bin \
+    rustc \
+    cargo || true
+  # ensure update-ca-certificates is available
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    update-ca-certificates || true
+  fi
+fi
 
 # create logs directory
 mkdir -p /var/log/phantomd

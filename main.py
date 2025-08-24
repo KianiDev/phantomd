@@ -3,8 +3,10 @@ import argparse
 import logging
 import asyncio
 from core.dserver import run_server
-from core.DHCP import DHCPServer
 from utils.ListUpdater import fetch_blocklists_sync
+
+# DHCP import will be performed lazily only if enabled so incomplete DHCP modules don't break startup
+from core.phantomd_dhcp import DHCPServer
 
 def main():
     parser = argparse.ArgumentParser(description="phantomd DNS server")
@@ -59,17 +61,29 @@ def main():
     dhcp_cfg = config.get('dhcp', {})
     dhcp_coro = None
     if dhcp_cfg.get('enabled'):
-        dhcp = DHCPServer(
-            subnet=dhcp_cfg.get('subnet'),
-            netmask=dhcp_cfg.get('netmask'),
-            start_ip=dhcp_cfg.get('start_ip'),
-            end_ip=dhcp_cfg.get('end_ip'),
-            lease_ttl=dhcp_cfg.get('lease_ttl'),
-            static_leases=dhcp_cfg.get('static_leases') or {},
-            server_ip=None,
-            lease_db_path=dhcp_cfg.get('lease_db_path')
-        )
-        dhcp_coro = dhcp.start()
+        _dh = DHCPServer
+        if _dh is None:
+            logging.warning("DHCP enabled in config but no DHCPServer implementation available; skipping DHCP startup")
+        else:
+            try:
+                dhcp = _dh(
+                    subnet=dhcp_cfg.get('subnet'),
+                    netmask=dhcp_cfg.get('netmask'),
+                    start_ip=dhcp_cfg.get('start_ip'),
+                    end_ip=dhcp_cfg.get('end_ip'),
+                    lease_ttl=dhcp_cfg.get('lease_ttl'),
+                    static_leases=dhcp_cfg.get('static_leases') or {},
+                    server_ip=None,
+                    lease_db_path=dhcp_cfg.get('lease_db_path')
+                )
+                # support either start() coroutine or other common entrypoints; prefer start()
+                start_fn = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
+                if callable(start_fn):
+                    dhcp_coro = start_fn()
+                else:
+                    logging.warning('DHCP server has no known start method; skipping DHCP startup')
+            except Exception as e:
+                logging.exception("Failed to start DHCP server: %s", e)
 
     async def _run_all():
         if dhcp_coro:

@@ -18,117 +18,10 @@ BLOCK_ACTION_ZEROIP = 'ZEROIP'
 BLOCK_ACTION_NX = 'NXDOMAIN'
 BLOCK_ACTION_REFUSED = 'REFUSED'
 
-# runtime block data
-BLOCK_EXACT: Set[str] = set()
-BLOCK_SUFFIX: Set[str] = set()
-BLOCK_HOSTS: Dict[str, Tuple[str]] = {}
+# runtime block action (keeps the configured action string)
 BLOCK_ACTION = BLOCK_ACTION_NX
 
 DISABLE_IPV6 = False
-
-
-def load_blocklists_from_dir(directory: str) -> Tuple[Set[str], Set[str], Dict[str, Tuple[str]]]:
-    exact_set = set()
-    suffix_set = set()
-    hosts_map = {}
-    if not os.path.isdir(directory):
-        return exact_set, suffix_set, hosts_map
-    for fname in os.listdir(directory):
-        path = os.path.join(directory, fname)
-        if not os.path.isfile(path):
-            continue
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.split('#', 1)[0].strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) == 0:
-                    continue
-                # hosts format: IP domain
-                if len(parts) >= 2 and (parts[0].count('.') == 3 or ':' in parts[0]):
-                    ip = parts[0]
-                    domain = parts[1].lower().rstrip('.')
-                    hosts_map[domain] = (ip,)
-                    exact_set.add(domain)
-                    continue
-                # simple domain entries
-                domain = parts[0].lower().rstrip('.')
-                if domain.startswith('.'):
-                    suffix_set.add(domain.lstrip('.'))
-                else:
-                    exact_set.add(domain)
-    return exact_set, suffix_set, hosts_map
-
-
-def _is_blocked(qname: str) -> bool:
-    q = qname.lower().rstrip('.')
-    if q in BLOCK_EXACT:
-        return True
-    # suffix match
-    labels = q.split('.')
-    for i in range(len(labels)):
-        candidate = '.'.join(labels[i:])
-        if candidate in BLOCK_SUFFIX:
-            return True
-    return False
-
-
-def _build_block_response(request_msg: dns.message.Message, action: str) -> bytes:
-    # defensive: if parsing failed, return a simple RCODE response
-    if request_msg is None:
-        resp = dns.message.Message()
-        if action == BLOCK_ACTION_REFUSED:
-            resp.set_rcode(dns.rcode.REFUSED)
-        else:
-            resp.set_rcode(dns.rcode.NXDOMAIN)
-        return resp.to_wire()
-
-    # create a response based on action
-    resp = dns.message.make_response(request_msg)
-    # clear any accidentally included answer sections
-    resp.answer = []
-
-    if action == BLOCK_ACTION_REFUSED:
-        resp.set_rcode(dns.rcode.REFUSED)
-        return resp.to_wire()
-
-    if action == BLOCK_ACTION_NX:
-        resp.set_rcode(dns.rcode.NXDOMAIN)
-        return resp.to_wire()
-
-    if action == BLOCK_ACTION_ZEROIP:
-        # If question is A/AAAA/ANY -> return appropriate zero IP answers
-        q = request_msg.question[0]
-        qname = q.name
-        qtype = q.rdtype
-        ttl = 60
-        if qtype == dns.rdatatype.A:
-            rrset = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.A, '0.0.0.0')
-            resp.answer.append(rrset)
-            return resp.to_wire()
-        elif qtype == dns.rdatatype.AAAA:
-            # if IPv6 disabled, return NXDOMAIN instead
-            if DISABLE_IPV6:
-                resp.set_rcode(dns.rcode.NXDOMAIN)
-                return resp.to_wire()
-            rrset = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
-            resp.answer.append(rrset)
-            return resp.to_wire()
-        elif qtype == dns.rdatatype.ANY:
-            a = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.A, '0.0.0.0')
-            resp.answer.append(a)
-            if not DISABLE_IPV6:
-                aaaa = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
-                resp.answer.append(aaaa)
-            return resp.to_wire()
-        # fallback NXDOMAIN for other types
-        resp.set_rcode(dns.rcode.NXDOMAIN)
-        return resp.to_wire()
-
-    # default NXDOMAIN
-    resp.set_rcode(dns.rcode.NXDOMAIN)
-    return resp.to_wire()
 
 
 class UDPResolverProtocol(asyncio.DatagramProtocol):
@@ -159,7 +52,8 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                 qname = None
             # Block AAAA queries if disable_ipv6 is True
             if self.disable_ipv6 and qtype == dns.rdatatype.AAAA:
-                resp_wire = _build_block_response(request_msg, BLOCK_ACTION_NX)
+                # use resolver to build the block response so policy/logging is centralized
+                resp_wire = self.resolver.build_block_response(data, action=BLOCK_ACTION_NX)
                 self.transport.sendto(resp_wire, addr)
                 logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
                 try:
@@ -167,8 +61,9 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                 except Exception:
                     pass
                 return
-            if qname and _is_blocked(qname):
-                resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
+            if qname and self.resolver.is_blocked(qname):
+                # centralize block response generation in resolver
+                resp_wire = self.resolver.build_block_response(data, action=BLOCK_ACTION)
                 self.transport.sendto(resp_wire, addr)
                 logging.debug(f"Blocked UDP DNS query for {qname} -> action {BLOCK_ACTION}")
                 try:
@@ -217,7 +112,8 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             qname = None
         # Block AAAA queries if disable_ipv6 is True
         if disable_ipv6 and qtype == dns.rdatatype.AAAA:
-            resp_wire = _build_block_response(request_msg, BLOCK_ACTION_NX)
+            # use resolver to build the response so block-action is consistent
+            resp_wire = resolver.build_block_response(data, action=BLOCK_ACTION_NX)
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
             await writer.drain()
             logging.debug(f"Blocked AAAA query for {qname} due to disable_ipv6")
@@ -226,8 +122,8 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             except Exception:
                 pass
             return
-        if qname and _is_blocked(qname):
-            resp_wire = _build_block_response(request_msg, BLOCK_ACTION)
+        if qname and resolver.is_blocked(qname):
+            resp_wire = resolver.build_block_response(data, action=BLOCK_ACTION)
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
             await writer.drain()
             logging.debug(f"Blocked TCP DNS query for {qname} -> action {BLOCK_ACTION}")
@@ -282,17 +178,15 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     loop = asyncio.get_running_loop()
 
     # load blocklists
-    global BLOCK_EXACT, BLOCK_HOSTS, BLOCK_SUFFIX, BLOCK_ACTION
-    BLOCK_EXACT = set()
-    BLOCK_HOSTS = {}
-    BLOCK_SUFFIX = set()
-    BLOCK_ACTION = BLOCK_ACTION_NX
+    global BLOCK_ACTION
     if blocklists:
         BLOCK_ACTION = blocklists.get('action', BLOCK_ACTION_NX)
-        exact_set, suffix_set, hosts_map = load_blocklists_from_dir('blocklists')
-        BLOCK_EXACT.update(exact_set)
-        BLOCK_SUFFIX.update(suffix_set)
-        BLOCK_HOSTS.update(hosts_map)
+        exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir('blocklists')
+        domains = list(exact_set) + ['.' + s for s in suffix_set]
+        resolver.set_blocklist(domains)
+        resolver.set_hosts_map(hosts_map)
+        # inform resolver of the configured runtime block action so it can synthesize responses
+        resolver.set_block_action(BLOCK_ACTION)
 
     # UDP listener
     udp_transport, _ = await loop.create_datagram_endpoint(
@@ -324,12 +218,10 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
             async def reload_loop():
                 while True:
                     await asyncio.sleep(interval)
-                    exact_set, hosts_map = load_blocklists_from_dir('blocklists')[:2]
-                    # load_blocklists_from_dir returns (exact, suffix, hosts)
-                    exact_set, suffix_set, hosts_map = load_blocklists_from_dir('blocklists')
-                    BLOCK_EXACT.clear(); BLOCK_EXACT.update(exact_set)
-                    BLOCK_HOSTS.clear(); BLOCK_HOSTS.update(hosts_map)
-                    BLOCK_SUFFIX.clear(); BLOCK_SUFFIX.update(suffix_set)
+                    exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir('blocklists')
+                    domains = list(exact_set) + ['.' + s for s in suffix_set]
+                    resolver.set_blocklist(domains)
+                    resolver.set_hosts_map(hosts_map)
             loop.create_task(reload_loop())
 
     try:

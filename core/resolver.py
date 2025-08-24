@@ -6,7 +6,8 @@ import struct
 import time
 import hashlib
 import ipaddress
-from typing import Optional, Tuple, Any
+import os
+from typing import Optional, Tuple, Any, Set, Dict
 from urllib.parse import urlparse
 
 try:
@@ -75,6 +76,14 @@ class AsyncTTLCache:
                 del self._data[oldest]
             self._data[key] = (value, time.time() + self._ttl)
 
+    async def delete(self, key):
+        async with self._lock:
+            try:
+                if key in self._data:
+                    del self._data[key]
+            except Exception:
+                pass
+
 
 class DNSResolver:
     """Async, robust DNS resolver/forwarder supporting UDP/TCP/DoT/DoH/DoQ (DoQ optional).
@@ -125,9 +134,11 @@ class DNSResolver:
         # cache
         if _HAS_CACHETOOLS:
             self._dns_cache = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+            self._wire_cache = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._cache_is_sync = True
         else:
             self._dns_cache = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+            self._wire_cache = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._cache_is_sync = False
 
         # timeouts & retry policy
@@ -191,6 +202,333 @@ class DNSResolver:
             except Exception as e:
                 self.logger.warning("Failed to enable uvloop: %s", e)
 
+        # blocklist structure (fast check). can be updated via set_blocklist()/add_blocked()
+        self._blocklist_exact = set()
+        self._blocklist_suffix = set()
+        # optional hosts map: exact domain -> tuple of fields (e.g. IP)
+        self._hosts_map = {}
+
+        # default block action
+        self._block_action = 'NXDOMAIN'
+
+    # ---------- blocklist helpers ----------
+    def set_blocklist(self, domains):
+        """Replace blocklist. domains is an iterable of domain strings.
+           Use ".example.com" to block suffix (subdomains), or "bad.example" to block exact name."""
+        self._blocklist_exact.clear()
+        self._blocklist_suffix.clear()
+        for d in domains:
+            d = d.strip().lower().rstrip('.')
+            if not d:
+                continue
+            if d.startswith("."):
+                self._blocklist_suffix.add(d.lstrip("."))
+            else:
+                self._blocklist_exact.add(d)
+
+    def set_hosts_map(self, hosts_map: dict):
+        """Provide an exact-domain -> tuple(...) mapping used to synthesize host responses.
+
+        Example: {'bad.example': ('0.0.0.0',)}
+        """
+        self._hosts_map = {k.lower().rstrip('.'): tuple(v) for k, v in (hosts_map or {}).items()}
+
+    def get_host_for(self, qname: str) -> Optional[Tuple[str, ...]]:
+        """Return tuple associated with exact qname or None."""
+        if not qname:
+            return None
+        return self._hosts_map.get(qname.lower().rstrip('.'))
+
+    def add_blocked(self, domain):
+        d = domain.strip().lower().rstrip('.')
+        if d.startswith("."):
+            self._blocklist_suffix.add(d.lstrip("."))
+        else:
+            self._blocklist_exact.add(d)
+
+    @staticmethod
+    def load_blocklists_from_dir(directory: str) -> Tuple[Set[str], Set[str], Dict[str, Tuple[str]]]:
+        """Load blocklist files from a directory. Returns (exact_set, suffix_set, hosts_map).
+
+        Each file may contain lines in hosts format (IP domain) or plain domain entries.
+        Lines beginning with # are ignored. Suffix blocks start with a leading dot.
+        """
+        exact_set = set()
+        suffix_set = set()
+        hosts_map = {}
+        if not os.path.isdir(directory):
+            return exact_set, suffix_set, hosts_map
+        for fname in os.listdir(directory):
+            path = os.path.join(directory, fname)
+            if not os.path.isfile(path):
+                continue
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.split('#', 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) == 0:
+                        continue
+                    # hosts format: IP domain
+                    if len(parts) >= 2 and (parts[0].count('.') == 3 or ':' in parts[0]):
+                        ip = parts[0]
+                        domain = parts[1].lower().rstrip('.')
+                        hosts_map[domain] = (ip,)
+                        exact_set.add(domain)
+                        continue
+                    # simple domain entries
+                    domain = parts[0].lower().rstrip('.')
+                    if domain.startswith('.'):
+                        suffix_set.add(domain.lstrip('.'))
+                    else:
+                        exact_set.add(domain)
+        return exact_set, suffix_set, hosts_map
+
+    def is_blocked(self, qname: Optional[str]) -> bool:
+        if not qname:
+            return False
+        q = qname.lower().rstrip('.')
+        if q in self._blocklist_exact:
+            return True
+        # suffix match: check progressively shorter suffixes
+        for suf in self._blocklist_suffix:
+            if q == suf or q.endswith("." + suf):
+                return True
+        return False
+
+    # ---------- wire-cache helpers ----------
+    async def _wire_cache_get(self, key):
+        """Return cached wire response bytes or None. key should be (qname, qtype)."""
+        try:
+            if self._cache_is_sync:
+                return self._wire_cache.get(key)
+            else:
+                return await self._wire_cache.get(key)
+        except Exception as e:
+            self.logger.debug("wire cache get error %s: %s", key, e)
+            return None
+
+    async def _wire_cache_set(self, key, response_bytes, ttl_seconds):
+        """Store wire response with TTL. If using sync TTLCache we can't set custom TTL per-entry;
+           we emulate by storing (response, expiry) in the cache value and still using configured TTL as fallback."""
+        try:
+            # We store a small tuple (resp, expiry_ts) as cache value so we can honor per-response TTLs even if cachetools only supports global TTL.
+            expiry = time.time() + max(1, int(ttl_seconds or 1))
+            val = (response_bytes, expiry)
+            if self._cache_is_sync:
+                # store raw tuple
+                self._wire_cache[key] = val
+            else:
+                await self._wire_cache.set(key, val)
+            self.logger.debug("wire cache set %s ttl=%s", key, ttl_seconds)
+        except Exception as e:
+            self.logger.debug("wire cache set error %s: %s", key, e)
+
+    async def _wire_cache_get_valid(self, key):
+        """Return bytes if still valid, else None. Handles tuple expiry used in set."""
+        try:
+            raw = await self._wire_cache_get(key)
+            if raw is None:
+                return None
+            # raw is either bytes (older behavior) or tuple (resp, expiry)
+            if isinstance(raw, tuple):
+                resp, expiry = raw
+                if time.time() >= expiry:
+                    # expired - remove it
+                    try:
+                        if self._cache_is_sync:
+                            try:
+                                del self._wire_cache[key]
+                            except Exception:
+                                pass
+                        else:
+                            await self._wire_cache.delete(key)
+                    except Exception:
+                        pass
+                    return None
+                return resp
+            # If it's raw bytes (older), return it (no per-item expiry possible)
+            return raw
+        except Exception:
+            return None
+
+    # ---------- parsing helpers ----------
+    def _extract_qname_from_wire(self, data: bytes) -> Optional[str]:
+        """Safely extract the question qname from a DNS wire-format message.
+
+        Uses a robust parser with bounds checks and pointer-loop protection similar
+        to the packet parser used for UDP responses.
+        """
+        try:
+            if not data or len(data) < 12:
+                return None
+            length = len(data)
+            def _parse_name(resp, offset, depth=0):
+                if depth > 20:
+                    raise Exception("pointer loop in qname parsing")
+                if offset >= len(resp):
+                    raise Exception("out of bounds in qname parsing")
+                labels = []
+                while True:
+                    if offset >= len(resp):
+                        raise Exception("out of bounds in qname parsing")
+                    l = resp[offset]
+                    if l == 0:
+                        offset += 1
+                        break
+                    if (l & 0xC0) == 0xC0:
+                        if offset + 1 >= len(resp):
+                            raise Exception("truncated pointer")
+                        ptr = ((l & 0x3F) << 8) | resp[offset+1]
+                        lbl, _ = _parse_name(resp, ptr, depth + 1)
+                        labels.append(lbl)
+                        offset += 2
+                        break
+                    if offset + 1 + l > len(resp):
+                        raise Exception("label extends past packet")
+                    labels.append(resp[offset+1:offset+1+l].decode('ascii', errors='ignore'))
+                    offset += 1 + l
+                return '.'.join(labels), offset
+            # question starts at byte 12
+            qname, _ = _parse_name(data, 12)
+            return qname
+        except Exception:
+            return None
+
+    def _extract_qtype_from_wire(self, data: bytes) -> Optional[int]:
+        try:
+            if not data or len(data) < 12:
+                return None
+            # skip qname
+            def _skip_name(resp, offset, depth=0):
+                if depth > 20:
+                    raise Exception("pointer loop")
+                while True:
+                    if offset >= len(resp):
+                        raise Exception("oob")
+                    l = resp[offset]
+                    if l == 0:
+                        return offset + 1
+                    if (l & 0xC0) == 0xC0:
+                        return offset + 2
+                    offset += 1 + l
+            off = _skip_name(data, 12)
+            if off + 4 > len(data):
+                return None
+            qtype = (data[off] << 8) | data[off+1]
+            return qtype
+        except Exception:
+            return None
+
+    def _make_nxdomain_response(self, query_data: bytes) -> bytes:
+        """Return NXDOMAIN wire response preserving TID and question section."""
+        if not query_data or len(query_data) < 12:
+            # fallback: minimal header with random tid
+            tid = 0
+            qpart = b''
+        else:
+            tid = int.from_bytes(query_data[0:2], 'big')
+            # copy question (from byte 12 to end of question section)
+            # we must find end of qname and include qtype/qclass (4 bytes)
+            try:
+                # reuse skip
+                def _skip_name(resp, offset, depth=0):
+                    if depth > 40:
+                        raise Exception("pointer loop")
+                    while True:
+                        if offset >= len(resp):
+                            raise Exception("oob")
+                        l = resp[offset]
+                        if l == 0:
+                            return offset + 1
+                        if (l & 0xC0) == 0xC0:
+                            return offset + 2
+                        offset += 1 + l
+                qend = _skip_name(query_data, 12)
+                qpart = query_data[12:qend + 4]  # name + qtype(2)+qclass(2)
+            except Exception:
+                qpart = query_data[12:]  # best-effort
+        # Build header: QR=1 (0x8000), RCODE=3 (NXDOMAIN => add 3) => flags = 0x8000 | 3 = 0x8003
+        flags = 0x8000 | 3
+        header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
+        return header + qpart
+
+    def _extract_min_ttl(self, response: bytes) -> int:
+        """Return minimum TTL present in the answer section (or a default)."""
+        try:
+            if not response or len(response) < 12:
+                return 0
+            qdcount = (response[4] << 8) | response[5]
+            ancount = (response[6] << 8) | response[7]
+            offset = 12
+            # skip questions
+            def _skip_name(resp, off, depth=0):
+                if depth > 40:
+                    raise Exception("pointer loop")
+                while True:
+                    if off >= len(resp):
+                        raise Exception("oob")
+                    l = resp[off]
+                    if l == 0:
+                        return off + 1
+                    if (l & 0xC0) == 0xC0:
+                        return off + 2
+                    off += 1 + l
+            for _ in range(qdcount):
+                _skip_name(response, offset)
+                offset += 4
+            # read answers
+            min_ttl = None
+            for _ in range(ancount):
+                _, i = self._parse_rr_name(response, offset)
+                if i + 10 > len(response):
+                    raise Exception("truncated answer header")
+                rtype = (response[i] << 8) | response[i+1]; rclass = (response[i+2] << 8) | response[i+3]
+                ttl = struct.unpack(">I", response[i+4:i+8])[0]
+                rdlen = (response[i+8] << 8) | response[i+9]
+                if i + 10 + rdlen > len(response):
+                    raise Exception("truncated rdata")
+                rdata = response[i+10:i+10+rdlen]
+                i += 10 + rdlen
+                if min_ttl is None or ttl < min_ttl:
+                    min_ttl = ttl
+            return min_ttl or 0
+        except Exception:
+            return 0
+
+    def _parse_rr_name(self, response: bytes, offset: int) -> Tuple[str, int]:
+        """Parse and return the resource record name from a DNS response.
+
+        Advances offset to the next section.
+        """
+        labels = []
+        try:
+            while True:
+                if offset >= len(response):
+                    raise Exception("out of bounds")
+                length = response[offset]
+                if length == 0:
+                    offset += 1
+                    break
+                if (length & 0xC0) == 0xC0:
+                    # pointer
+                    if offset + 1 >= len(response):
+                        raise Exception("truncated pointer")
+                    ptr = ((length & 0x3F) << 8) | response[offset+1]
+                    lbl, _ = self._parse_rr_name(response, ptr)
+                    labels.append(lbl)
+                    offset += 2
+                    break
+                if offset + 1 + length > len(response):
+                    raise Exception("label extends past packet")
+                labels.append(response[offset+1:offset+1+length].decode('ascii', errors='ignore'))
+                offset += 1 + length
+            name = '.'.join(labels)
+            return name, offset
+        except Exception:
+            return "", offset
+
     async def _cache_get(self, key):
         """Retrieve from cache. Logs hit/miss at DEBUG level."""
         try:
@@ -198,7 +536,7 @@ class DNSResolver:
                 val = self._dns_cache.get(key)
             else:
                 val = await self._dns_cache.get(key)
-            if val:
+            if val is not None:
                 self.logger.debug("cache hit for %s -> %s", key, val)
             else:
                 self.logger.debug("cache miss for %s", key)
@@ -268,6 +606,11 @@ class DNSResolver:
                 self._file_logger.info(msg)
             except Exception:
                 pass
+
+    # Public alias for external callers (dserver uses this)
+    def log_dns_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None):
+        """Public wrapper for internal _log_event to avoid accessing a private method."""
+        return self._log_event(status, qname, client, details)
 
     async def _check_cert_pins(self, hostname: str, ssl_obj):
         """Verify peer certificate against pinned_certs (sha256 of DER cert).
@@ -456,50 +799,26 @@ class DNSResolver:
             raise
         self.logger.debug("DNSSEC validation passed for %s", qname)
 
-    def _extract_qname_from_wire(self, data: bytes) -> Optional[str]:
-        """Safely extract the question qname from a DNS wire-format message.
-
-        Uses a robust parser with bounds checks and pointer-loop protection similar
-        to the packet parser used for UDP responses.
-        """
-        try:
-            if not data or len(data) < 12:
-                return None
-            length = len(data)
-            def _parse_name(resp, offset, depth=0):
-                if depth > 20:
-                    raise Exception("pointer loop in qname parsing")
-                if offset >= len(resp):
-                    raise Exception("out of bounds in qname parsing")
-                labels = []
-                while True:
-                    if offset >= len(resp):
-                        raise Exception("out of bounds in qname parsing")
-                    l = resp[offset]
-                    if l == 0:
-                        offset += 1
-                        break
-                    if (l & 0xC0) == 0xC0:
-                        if offset + 1 >= len(resp):
-                            raise Exception("truncated pointer")
-                        ptr = ((l & 0x3F) << 8) | resp[offset+1]
-                        lbl, _ = _parse_name(resp, ptr, depth + 1)
-                        labels.append(lbl)
-                        offset += 2
-                        break
-                    if offset + 1 + l > len(resp):
-                        raise Exception("label extends past packet")
-                    labels.append(resp[offset+1:offset+1+l].decode('ascii', errors='ignore'))
-                    offset += 1 + l
-                return '.'.join(labels), offset
-            # question starts at byte 12
-            qname, _ = _parse_name(data, 12)
-            return qname
-        except Exception:
-            return None
-
     async def forward_dns_query(self, data: bytes) -> bytes:
-        """Dispatch to chosen protocol. Overridden to add DNSSEC validation and metrics where applicable."""
+        """Top-level: check blocklist, check wire cache, forward to upstream, DNSSEC validate, store in wire cache."""
+        # extract qname and qtype for cache key and blocklist
+        qname = self._extract_qname_from_wire(data)
+        qtype = self._extract_qtype_from_wire(data) or 1
+        key = (qname or "", qtype, self.protocol)
+
+        # blocklist check
+        if self.is_blocked(qname):
+            self._log_event("Blocked (internal)", qname, None, "blocklist")
+            # return NXDOMAIN preserving TID/question
+            return self._make_nxdomain_response(data)
+
+        # check wire cache
+        cached = await self._wire_cache_get_valid(key)
+        if cached:
+            self.logger.debug("wire-cache hit %s", key)
+            return cached
+
+        # forward by protocol (uses your existing _with_retries + _forward_* methods)
         proto = self.protocol
         if proto == "udp":
             resp = await self._with_retries(self._forward_udp, data, timeout=self.udp_timeout)
@@ -523,17 +842,20 @@ class DNSResolver:
             except Exception:
                 pass
 
-        # DNSSEC validate if enabled
+        # DNSSEC validate if enabled (existing)
         if self.dnssec_enabled:
-            qname = self._extract_qname_from_wire(data)
             if qname:
                 try:
                     await self._dnssec_validate(qname, resp)
                 except Exception as e:
                     self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                    # treat failed validation as a hard error
                     raise
 
+        # compute TTL to store in wire cache
+        ttl = self._extract_min_ttl(resp)
+        if ttl <= 0:
+            ttl = 30  # small fallback TTL
+        await self._wire_cache_set(key, resp, ttl)
         return resp
 
     # --- forwarding implementations ------------------------------------------------
@@ -740,7 +1062,7 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
-    async def _forward_quic(self, data: bytes) -> bytes:
+    async def _forward_quic(self, data: bytes):
         host, port = self._split_hostport(self.upstream_dns, default_port=784)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
@@ -881,9 +1203,16 @@ class DNSResolver:
         if self.dns_resolver_server:
             self.logger.debug("falling back to configured dns_resolver_server: %s", self.dns_resolver_server)
             try:
-                ip, port = self.dns_resolver_server.split(":")
-                port = int(port)
-                addr = await self._udp_query_a_or_aaaa(ip, port, hostname)
+                # split on last colon to allow IPv6 literals without brackets or host:port forms
+                parts = self.dns_resolver_server.rsplit(":", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    ip, port = parts[0], int(parts[1])
+                else:
+                    ip, port = parts[0], 53
+                # First try A, then AAAA if A fails (makes fallback more robust)
+                addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=1)
+                if not addr:
+                    addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=28)
                 if addr:
                     await self._cache_set(key, addr)
                     self.logger.debug("resolver server returned %s for %s", addr, hostname)
@@ -894,7 +1223,7 @@ class DNSResolver:
         self.logger.error("unable to resolve upstream hostname: %s", hostname)
         raise Exception(f"Unable to resolve upstream hostname: {hostname}")
 
-    async def _udp_query_a_or_aaaa(self, resolver_ip: str, resolver_port: int, qname: str) -> Optional[str]:
+    async def _udp_query_a_or_aaaa(self, resolver_ip: str, resolver_port: int, qname: str, qtype: int = 1) -> Optional[str]:
         """Perform minimal DNS query (A then AAAA) against resolver_ip:port using non-blocking sockets.
 
         Logs the outgoing lookup and parses the response, returning the first A/AAAA found.
@@ -910,11 +1239,11 @@ class DNSResolver:
         sock = socket.socket(fam, socket.SOCK_DGRAM)
         sock.setblocking(False)
         try:
-            # build simple query for A record
+            # build query for provided qtype (1=A, 28=AAAA)
             tid = int(time.time() * 1000) & 0xFFFF
             header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
             q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in qname.split("."))
-            q += b"\x00" + struct.pack(">HH", 1, 1)
+            q += b"\x00" + struct.pack(">HH", int(qtype), 1)
             query = header + q
             # for IPv6, supply a 4-tuple where supported
             addr_tuple = (resolver_ip, resolver_port) if fam == socket.AF_INET else (resolver_ip, resolver_port, 0, 0)
@@ -922,7 +1251,7 @@ class DNSResolver:
             try:
                 data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 4096), timeout=self.udp_timeout)
             except asyncio.TimeoutError:
-                self.logger.debug("udp lookup timed out for %s", qname)
+                self.logger.debug("udp lookup timed out for %s (qtype=%s)", qname, qtype)
                 return None
             # parse answers (very small parser)
             def parse_name(resp, offset, depth=0):
@@ -982,11 +1311,180 @@ class DNSResolver:
                     except Exception:
                         # fallback to hex formatting
                         aaaa_addr = ":".join("{:02x}{:02x}".format(rdata[j], rdata[j+1]) for j in range(0, 16, 2))
-            # prefer A if disable_ipv6
-            if self.disable_ipv6:
-                self.logger.debug("udp lookup result for %s -> %s (ipv4 preferred)", qname, a_addr)
+            # return according to requested qtype preference
+            if qtype == 1:
+                self.logger.debug("udp lookup result for %s (A) -> %s", qname, a_addr)
                 return a_addr or None
+            if qtype == 28:
+                self.logger.debug("udp lookup result for %s (AAAA) -> %s", qname, aaaa_addr)
+                return aaaa_addr or None
+            # fallback: prefer A then AAAA
             self.logger.debug("udp lookup result for %s -> %s", qname, a_addr or aaaa_addr)
             return a_addr or aaaa_addr
         finally:
             sock.close()
+
+    # ---------- block action helpers ----------
+    def set_block_action(self, action: str):
+        """Set how the server should respond for blocked domains: 'ZEROIP', 'NXDOMAIN', or 'REFUSED'."""
+        try:
+            if action is None:
+                action = 'NXDOMAIN'
+            self._block_action = str(action).upper()
+        except Exception:
+            self._block_action = 'NXDOMAIN'
+
+    def get_block_action(self) -> str:
+        """Return currently configured block action (default 'NXDOMAIN')."""
+        return getattr(self, '_block_action', 'NXDOMAIN')
+
+    def build_block_response(self, request_data: bytes, action: Optional[str] = None) -> bytes:
+        """Build a wire-format DNS response for a blocked query according to action.
+
+        If action is None, uses the resolver's configured block action.
+        """
+        use_action = action or self.get_block_action()
+        try:
+            # if dnspython is available, prefer that for correct formatting
+            if _HAS_DNSPY:
+                try:
+                    request_msg = dns.message.from_wire(request_data)
+                except Exception:
+                    request_msg = None
+                # fallback to NXDOMAIN if parsing failed and action isn't ZEROIP
+                if request_msg is None and use_action != 'ZEROIP':
+                    return self._make_nxdomain_response(request_data)
+                if request_msg is None:
+                    resp = dns.message.Message()
+                    if use_action == 'REFUSED':
+                        resp.set_rcode(dns.rcode.REFUSED)
+                    else:
+                        resp.set_rcode(dns.rcode.NXDOMAIN)
+                    return resp.to_wire()
+                resp = dns.message.make_response(request_msg)
+                resp.answer = []
+                if use_action == 'REFUSED':
+                    resp.set_rcode(dns.rcode.REFUSED)
+                    return resp.to_wire()
+                if use_action == 'NXDOMAIN':
+                    resp.set_rcode(dns.rcode.NXDOMAIN)
+                    return resp.to_wire()
+                if use_action == 'ZEROIP':
+                    # If question is A/AAAA/ANY -> return appropriate zero IP answers
+                    if not request_msg.question:
+                        resp.set_rcode(dns.rcode.NXDOMAIN)
+                        return resp.to_wire()
+                    q = request_msg.question[0]
+                    qname = q.name
+                    qtype = q.rdtype
+                    ttl = 60
+                    if qtype == dns.rdatatype.A:
+                        rrset = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.A, '0.0.0.0')
+                        resp.answer.append(rrset)
+                        return resp.to_wire()
+                    elif qtype == dns.rdatatype.AAAA:
+                        if self.disable_ipv6:
+                            resp.set_rcode(dns.rcode.NXDOMAIN)
+                            return resp.to_wire()
+                        rrset = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
+                        resp.answer.append(rrset)
+                        return resp.to_wire()
+                    elif qtype == dns.rdatatype.ANY:
+                        a = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.A, '0.0.0.0')
+                        resp.answer.append(a)
+                        if not self.disable_ipv6:
+                            aaaa = dns.rrset.from_text(str(qname), ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, '::')
+                            resp.answer.append(aaaa)
+                        return resp.to_wire()
+                    resp.set_rcode(dns.rcode.NXDOMAIN)
+                    return resp.to_wire()
+            # If dnspython not available, build minimal wire responses
+            # NXDOMAIN / REFUSED can be made by preserving TID/question; ZEROIP needs manual answer crafting
+            if use_action == 'REFUSED':
+                # build header with RCODE=5
+                if not request_data or len(request_data) < 12:
+                    tid = 0
+                    qpart = b''
+                else:
+                    tid = int.from_bytes(request_data[0:2], 'big')
+                    try:
+                        def _skip_name(resp, offset, depth=0):
+                            if depth > 40:
+                                raise Exception("pointer loop")
+                            while True:
+                                if offset >= len(resp):
+                                    raise Exception("oob")
+                                l = resp[offset]
+                                if l == 0:
+                                    return offset + 1
+                                if (l & 0xC0) == 0xC0:
+                                    return offset + 2
+                                offset += 1 + l
+                        qend = _skip_name(request_data, 12)
+                        qpart = request_data[12:qend + 4]
+                    except Exception:
+                        qpart = request_data[12:]
+                flags = 0x8000 | 5
+                header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
+                return header + qpart
+            if use_action == 'NXDOMAIN':
+                return self._make_nxdomain_response(request_data)
+            if use_action == 'ZEROIP':
+                # parse qname and qtype and build an answer with pointer to question (0xc00c)
+                qname = self._extract_qname_from_wire(request_data)
+                qtype = self._extract_qtype_from_wire(request_data) or 1
+                # build header
+                if not request_data or len(request_data) < 12:
+                    tid = 0
+                    qpart = b''
+                else:
+                    tid = int.from_bytes(request_data[0:2], 'big')
+                    try:
+                        def _skip_name(resp, offset, depth=0):
+                            if depth > 40:
+                                raise Exception("pointer loop")
+                            while True:
+                                if offset >= len(resp):
+                                    raise Exception("oob")
+                                l = resp[offset]
+                                if l == 0:
+                                    return offset + 1
+                                if (l & 0xC0) == 0xC0:
+                                    return offset + 2
+                                offset += 1 + l
+                        qend = _skip_name(request_data, 12)
+                        qpart = request_data[12:qend + 4]
+                    except Exception:
+                        qpart = request_data[12:]
+                flags = 0x8000
+                # qdcount=1, ancount=1
+                header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
+                # answer: name pointer to 0xC00C, type, class IN, ttl, rdlen, rdata
+                name_ptr = b'\xc0\x0c'
+                if qtype == 1:  # A
+                    rtype = (1).to_bytes(2, 'big')
+                    rclass = (1).to_bytes(2, 'big')
+                    ttl = (60).to_bytes(4, 'big')
+                    rdlen = (4).to_bytes(2, 'big')
+                    rdata = b'\x00\x00\x00\x00'
+                elif qtype == 28:  # AAAA
+                    if self.disable_ipv6:
+                        return self._make_nxdomain_response(request_data)
+                    rtype = (28).to_bytes(2, 'big')
+                    rclass = (1).to_bytes(2, 'big')
+                    ttl = (60).to_bytes(4, 'big')
+                    rdlen = (16).to_bytes(2, 'big')
+                    rdata = b'\x00' * 16
+                elif qtype == 255:  # ANY
+                    # build A + AAAA answers
+                    a_ans = name_ptr + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (4).to_bytes(2, 'big') + b'\x00\x00\x00\x00'
+                    if self.disable_ipv6:
+                        return header + qpart + a_ans
+                    aaaa_ans = name_ptr + (28).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (16).to_bytes(2, 'big') + (b'\x00' * 16)
+                    return header + qpart + a_ans + aaaa_ans
+                else:
+                    return self._make_nxdomain_response(request_data)
+                ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
+                return header + qpart + ans
+        except Exception:
+            return self._make_nxdomain_response(request_data)
