@@ -564,6 +564,14 @@ class DHCPServer:
             logger.debug('DB init failed: %s', e)
         if not self.server_ip or self.server_ip == '0.0.0.0':
             self.server_ip = bind_ip
+        # If binding to a privileged port (<1024) ensure we have sufficient privileges
+        try:
+            if bind_port < 1024 and os.geteuid() != 0:
+                logger.error('Insufficient privileges to bind to port %d. Run as root or use CAP_NET_BIND_SERVICE, or for testing bind to a non-privileged port (e.g., 6767).', bind_port)
+                raise PermissionError(f'Cannot bind to privileged port {bind_port} without root')
+        except AttributeError:
+            # os.geteuid may not be available on some platforms; skip check
+            pass
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             try:
@@ -586,7 +594,15 @@ class DHCPServer:
             logger.info('DHCP server bound to %s:%d', bind_ip, bind_port)
         except Exception as e:
             sock.close()
-            logger.error('Failed to bind DHCP socket: %s', e)
+            try:
+                import errno
+                if hasattr(e, 'errno') and e.errno:
+                    logger.error('Failed to bind DHCP socket to %s:%d: %s (errno=%s)', bind_ip, bind_port, e, e.errno)
+                else:
+                    logger.error('Failed to bind DHCP socket to %s:%d: %s', bind_ip, bind_port, e)
+            except Exception:
+                logger.error('Failed to bind DHCP socket: %s', e)
+            logger.error('If you are testing, try a non-privileged port like 6767 or run with appropriate privileges')
             raise
         try:
             self.drop_privileges(user='nobody')
