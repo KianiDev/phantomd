@@ -1,28 +1,3 @@
-"""
-phantomd_dhcp_server_with_tests.py
-
-Consolidated DHCP server (production-ish) + test harness.
-
-What this file provides:
-- DHCPServer class (DB-backed via aiosqlite if available, mirrored in-memory leases)
-- DHCPProtocol asyncio.DatagramProtocol
-- CLI entrypoint to run the server: `python3 phantomd_dhcp_server_with_tests.py serve --bind 0.0.0.0 --port 67`
-- Pytest-compatible test functions for core flows. These are integration tests that use Scapy
-  and therefore require root and an isolated test interface (or network namespace). They are
-  placed under the `tests` namespace and will be skipped if Scapy isn't available.
-
-Notes:
-- This file assumes `arping` and necessary privileges exist on the host.
-- The tests are destructive on the test network (they send broadcasts). Run them in a lab.
-
-Usage examples:
-  # run server (requires root to bind 67)
-  sudo python3 phantomd_dhcp_server_with_tests.py serve --bind 0.0.0.0 --port 67 --subnet 192.168.50.0 --netmask 255.255.255.0 --start 192.168.50.100 --end 192.168.50.200
-
-  # run pytest tests (as root in a test namespace)
-  sudo pytest phantomd_dhcp_server_with_tests.py::test_discover_offer_request_ack -q
-
-"""
 from __future__ import annotations
 
 import argparse
@@ -89,6 +64,17 @@ def int_to_ip(i: int) -> str:
     return socket.inet_ntoa(struct.pack('>I', i))
 
 
+def calc_broadcast(ip: str, netmask: str) -> str:
+    """Calculate the subnet broadcast address for given ip/netmask."""
+    try:
+        ip_i = ip_to_int(ip)
+        mask_i = ip_to_int(netmask)
+        bcast_i = (ip_i & mask_i) | (~mask_i & 0xFFFFFFFF)
+        return int_to_ip(bcast_i)
+    except Exception:
+        return '255.255.255.255'
+
+
 class LeaseExpired(Exception):
     pass
 
@@ -135,6 +121,17 @@ class DHCPServer:
 
         # concurrency
         self._lock = asyncio.Lock()
+
+        # rate limiting / buckets and internal state
+        self._offered: Dict[str, Tuple[str, float]] = {}
+        self._conflicted_ips: Dict[str, float] = {}
+        self.rate_limit_rps = 10.0
+        self.rate_limit_burst = 20.0
+        self._mac_buckets: Dict[str, Tuple[float, float]] = {}
+        self._ip_buckets: Dict[str, Tuple[float, float]] = {}
+
+        # broadcast ip placeholder
+        self.broadcast_ip: Optional[str] = None
 
         # load persisted leases if present
         try:
@@ -410,6 +407,11 @@ class DHCPServer:
         # build offer
         try:
             pkt = self.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPOFFER, prl=prl, include_t1t2=True)
+            # record offered IP + timestamp
+            try:
+                self._offered[self._normalize_mac(chaddr)] = (ip, time.time())
+            except Exception:
+                pass
             return pkt
         except Exception as e:
             logger.exception("Failed to build DHCPOFFER: %s", e)
@@ -428,7 +430,7 @@ class DHCPServer:
             xid, 0, 0,
             b'\0'*4,
             b'\0'*4,
-            socket.inet_aton(self.server_ip),
+            socket.inet_aton(self.server_ip if self.server_ip else '0.0.0.0'),
             b'\0'*4,
             chaddr + b'\0'*(16-len(chaddr)),
             b'\0'*64,
@@ -436,7 +438,7 @@ class DHCPServer:
         )
         opts = {
             OPTION_MESSAGE_TYPE: bytes([DHCPNAK]),
-            OPTION_SERVER_ID: socket.inet_aton(self.server_ip)
+            OPTION_SERVER_ID: socket.inet_aton(self.server_ip if self.server_ip else '0.0.0.0')
         }
         return header + self.build_options(opts)
 
@@ -539,8 +541,8 @@ class DHCPServer:
                         logger.debug('Error removing conflicted lease from DB: %s', e)
                 else:
                     try:
-                        for m, (a, _) in list(self.leases.items()):
-                            if a == ip:
+                        for m, info in list(self.leases.items()):
+                            if info.get('ip') == ip:
                                 del self.leases[m]
                                 break
                     except Exception as e:
@@ -564,6 +566,12 @@ class DHCPServer:
             logger.debug('DB init failed: %s', e)
         if not self.server_ip or self.server_ip == '0.0.0.0':
             self.server_ip = bind_ip
+        # compute broadcast for subnet if possible
+        try:
+            if self.server_ip and self.netmask:
+                self.broadcast_ip = calc_broadcast(self.server_ip, self.netmask)
+        except Exception:
+            self.broadcast_ip = None
         # If binding to a privileged port (<1024) ensure we have sufficient privileges
         try:
             if bind_port < 1024 and os.geteuid() != 0:
@@ -590,6 +598,21 @@ class DHCPServer:
                     logger.debug('Set SO_REUSEPORT')
             except Exception as e:
                 logger.debug('Failed to set SO_REUSEPORT: %s', e, exc_info=True)
+
+            # Optionally bind to specific interface for egress
+            try:
+                ifname = os.environ.get('PHANTOMD_IFACE')
+                if ifname:
+                    try:
+                        # SO_BINDTODEVICE is Linux-specific; fallback to numeric value 25 if missing
+                        so_bind = getattr(socket, 'SO_BINDTODEVICE', 25)
+                        sock.setsockopt(socket.SOL_SOCKET, so_bind, ifname.encode() + b'\x00')
+                        logger.info('Bound DHCP socket to interface %s', ifname)
+                    except Exception as e:
+                        logger.warning('SO_BINDTODEVICE failed: %s', e)
+            except Exception:
+                pass
+
             sock.bind((bind_ip, bind_port))
             logger.info('DHCP server bound to %s:%d', bind_ip, bind_port)
         except Exception as e:
@@ -641,6 +664,23 @@ class DHCPProtocol(asyncio.DatagramProtocol):
         self.transport = transport
         logger.info("DHCP server listening")
 
+    def _send_packet(self, pkt: bytes, dst_ip: str, dst_port: int = 68, broadcast: bool = False):
+        """Send using the underlying socket if available so we can set broadcast option."""
+        try:
+            sock = self.transport.get_extra_info('socket')
+            if sock is None:
+                # fallback to transport
+                self.transport.sendto(pkt, (dst_ip, dst_port))
+                return
+            if broadcast:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except Exception:
+                    pass
+            sock.sendto(pkt, (dst_ip, dst_port))
+        except Exception as e:
+            logger.exception("Failed to send DHCP packet: %s", e)
+
     def datagram_received(self, data: bytes, addr):
         # minimal parse: extract op,xid,chaddr and options
         try:
@@ -648,6 +688,8 @@ class DHCPProtocol(asyncio.DatagramProtocol):
                 return
             op = data[0]
             xid = struct.unpack('>I', data[4:8])[0]
+            flags = struct.unpack('>H', data[10:12])[0]
+            ciaddr = socket.inet_ntoa(data[12:16])
             chaddr = data[28:34]
             opts = self.server.parse_options(data[240:])
             msg_type = opts.get(OPTION_MESSAGE_TYPE)
@@ -658,25 +700,45 @@ class DHCPProtocol(asyncio.DatagramProtocol):
                     requested = socket.inet_ntoa(opts[OPTION_REQUESTED_IP])
                 except Exception:
                     requested = None
+            # If no requested option, fallback to ciaddr if present
+            if not requested and ciaddr != '0.0.0.0':
+                requested = ciaddr
+
+            # Determine whether to broadcast the reply
+            want_broadcast = bool(flags & 0x8000) or addr[0] == '0.0.0.0' or ciaddr == '0.0.0.0'
+            bcast_ip = self.server.broadcast_ip or '255.255.255.255'
+
+            def send_reply(pkt: bytes, yiaddr: Optional[str] = None):
+                # Try unicast to yiaddr when appropriate and possible
+                if not want_broadcast and yiaddr and yiaddr != '0.0.0.0':
+                    try:
+                        self._send_packet(pkt, yiaddr, 68, broadcast=False)
+                        return
+                    except Exception:
+                        pass
+                # default: broadcast
+                self._send_packet(pkt, bcast_ip, 68, broadcast=True)
+
             if msg_type:
                 mt = msg_type[0]
                 if mt == DHCPDISCOVER:
                     offer = self.server.handle_discover(xid, chaddr, requested, prl)
                     if offer:
-                        self.transport.sendto(offer, addr)
-                        logger.info("Offered %s to %s", self.server.leases.get(self.server._normalize_mac(chaddr), {}).get('ip'), self.server._normalize_mac(chaddr))
+                        yi = self.server.leases.get(self.server._normalize_mac(chaddr), {}).get('ip')
+                        send_reply(offer, yi)
+                        logger.info("Offered %s to %s (broadcast=%s)", yi, self.server._normalize_mac(chaddr), want_broadcast)
                 elif mt == DHCPREQUEST:
                     # very simple REQUEST handling: if we hold lease for this MAC -> ACK, else NAK
                     macn = self.server._normalize_mac(chaddr)
                     if macn and macn in self.server.leases:
                         ip = self.server.leases[macn]['ip']
                         ack = self.server.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPACK, prl=prl, include_t1t2=True)
-                        self.transport.sendto(ack, addr)
-                        logger.info("ACKed %s for %s", ip, macn)
+                        send_reply(ack, ip)
+                        logger.info("ACKed %s for %s (broadcast=%s)", ip, macn, want_broadcast)
                     else:
                         nak = self.server.build_reply(BOOTREPLY, xid, chaddr, '0.0.0.0', DHCPNAK, prl=prl)
-                        self.transport.sendto(nak, addr)
-                        logger.info("NAK for %s", macn)
+                        send_reply(nak, None)
+                        logger.info("NAK for %s (broadcast=%s)", macn, want_broadcast)
                 elif mt == DHCPRELEASE:
                     macn = self.server._normalize_mac(chaddr)
                     if macn and macn in self.server.leases:
@@ -691,6 +753,7 @@ class DHCPProtocol(asyncio.DatagramProtocol):
 
 
 # --------------------------- CLI / tests --------------------------- #
+
 
 def serve_cli(bind='0.0.0.0', port=6767, **kwargs):
     srv = DHCPServer(kwargs.get('subnet', '192.168.100.0'), kwargs.get('netmask', '255.255.255.0'), kwargs.get('start_ip', '192.168.100.100'), kwargs.get('end_ip', '192.168.100.200'), lease_ttl=kwargs.get('lease_ttl', 86400), static_leases=kwargs.get('static_leases', {}), server_ip=kwargs.get('server_ip'))

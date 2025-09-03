@@ -44,42 +44,36 @@ fi
 python3 -m venv "$VENV_DIR"
 . "$VENV_DIR/bin/activate"
 
-echo "Upgrading pip and installing dependencies from requirements.txt..."
-# Best-effort install dependencies from bundled requirements.txt
+echo "Upgrading pip and installing runtime dependencies from requirements.txt..."
+# Best-effort install runtime dependencies only. Development/test deps are intentionally
+# not included in requirements.txt and should be installed by developers in their envs.
 pip install --upgrade pip
 if [ -f "$INSTALL_DIR/requirements.txt" ]; then
   pip install -r "$INSTALL_DIR/requirements.txt" || true
 else
   pip install --upgrade pip
-  pip install httpx aiohttp dnspython requests cachetools aioquic aiosqlite cryptography prometheus_client uvloop pytest hypothesis boofuzz aioratelimit || true
+  pip install httpx aiohttp dnspython requests cachetools aiosqlite cryptography prometheus_client uvloop || true
 fi
 
 # try to install some OS-level helper packages if apt is available
 if command -v apt >/dev/null 2>&1; then
-  echo "Installing system packages via apt..."
+  echo "Installing minimal runtime packages via apt..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y || true
+  # Install only minimal runtime helpers. Do not install heavy build toolchains here.
   apt-get install -y --no-install-recommends \
-    build-essential \
     python3-venv \
     python3-dev \
-    libssl-dev \
-    libffi-dev \
-    libxml2-dev \
-    libxslt1-dev \
-    zlib1g-dev \
-    pkg-config \
     ca-certificates \
-    wget \
     curl \
     iputils-arping \
-    libcap2-bin \
-    rustc \
-    cargo || true
-  # ensure update-ca-certificates is available
+    libcap2-bin || true
+  # update CA certs if available
   if command -v update-ca-certificates >/dev/null 2>&1; then
     update-ca-certificates || true
   fi
+  echo "Note: If you need to build binary wheels (cryptography, aioquic) on this host,"
+  echo "install build-essential, libssl-dev, rustc and cargo separately before running pip."
 fi
 
 # create logs directory
@@ -100,6 +94,8 @@ After=network.target
 Type=simple
 ExecStart=/opt/phantomd/venv/bin/python /opt/phantomd/main.py
 Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=off
 User=root
 WorkingDirectory=/opt/phantomd
 StandardOutput=syslog
