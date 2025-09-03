@@ -4,7 +4,7 @@ set -eu
 # Fetches repository tarball, sets up virtualenv, installs deps, creates systemd service,
 # and writes config/phantomd.conf interactively.
 
-VERSION="0.1.0"
+VERSION="1.0.4"
 REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
 INSTALL_DIR="/opt/phantomd"
 VENV_DIR="$INSTALL_DIR/venv"
