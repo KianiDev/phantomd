@@ -119,8 +119,13 @@ class DHCPServer:
         # reverse map ip -> mac for quick conflict checks
         self.ip_map: Dict[str, str] = {}
 
+        # optional sqlite DB handle (set by _init_db if used)
+        self._db = None
+
         # concurrency
         self._lock = asyncio.Lock()
+        # sqlite write serialization lock
+        self._db_lock = asyncio.Lock()
 
         # rate limiting / buckets and internal state
         self._offered: Dict[str, Tuple[str, float]] = {}
@@ -139,8 +144,49 @@ class DHCPServer:
         except Exception as e:
             logger.warning("Failed to load DHCP leases: %s", e)
 
-        # ensure save on exit
-        atexit.register(self._save_leases)
+        # ensure save/cleanup on exit
+        atexit.register(self._finalize)
+
+    def _finalize(self):
+        # Try to close sqlite DB cleanly and fallback to saving JSON leases
+        try:
+            db = getattr(self, '_db', None)
+            if db is not None:
+                try:
+                    # If there is no running event loop we can safely run the
+                    # coroutine to close the DB. If an event loop is running,
+                    # schedule the close onto that loop instead to avoid
+                    # calling asyncio.run() from inside a running loop.
+                    try:
+                        running = asyncio.get_running_loop()
+                    except RuntimeError:
+                        # no running loop -> safe to run
+                        try:
+                            asyncio.run(db.close())
+                        except Exception:
+                            logger.debug('Exception while closing sqlite DB in finalize (no running loop)', exc_info=True)
+                    else:
+                        # event loop is running; try to schedule close on it.
+                        try:
+                            if hasattr(self, 'loop') and self.loop is running:
+                                # same loop we started on
+                                self.loop.create_task(db.close())
+                            else:
+                                # Best-effort: submit to the running loop thread-safely
+                                try:
+                                    asyncio.run_coroutine_threadsafe(db.close(), running)
+                                except Exception:
+                                    logger.debug('Failed to submit DB close to running loop', exc_info=True)
+                        except Exception:
+                            logger.debug('Unexpected error while scheduling DB close', exc_info=True)
+                except Exception:
+                    logger.debug('Unexpected error during finalize DB close', exc_info=True)
+        except Exception:
+            logger.debug('Unexpected error entering finalize()', exc_info=True)
+        try:
+            self._save_leases()
+        except Exception:
+            logger.debug('Failed to save leases during finalize', exc_info=True)
 
     def _normalize_mac(self, mac) -> Optional[str]:
         if mac is None:
@@ -163,6 +209,13 @@ class DHCPServer:
 
     def _load_leases(self):
         # JSON-backed simple storage
+        try:
+            p = str(self.lease_db_path) if self.lease_db_path else ''
+        except Exception:
+            p = ''
+        # if using sqlite backend, skip JSON loading
+        if p.lower().endswith('.sqlite'):
+            return
         if not self.lease_db_path:
             return
         try:
@@ -206,11 +259,69 @@ class DHCPServer:
             logger.warning("Failed to save leases to %s: %s", self.lease_db_path, e)
 
     async def _init_db(self):
-        # placeholder for sqlite init if desired
+        # Initialize sqlite backend when requested (lease_db_path should point to a .sqlite file)
         if aiosqlite is None:
             return
-        # Future: implement sqlite migration
-        return
+        if not self.lease_db_path:
+            return
+        # Only treat .sqlite paths as sqlite DBs
+        try:
+            p = str(self.lease_db_path)
+        except Exception:
+            return
+        if not p.lower().endswith('.sqlite'):
+            return
+        # ensure directory exists
+        try:
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+        except Exception:
+            logger.debug('Failed to ensure sqlite directory %s', p, exc_info=True)
+        try:
+            self._db = await aiosqlite.connect(p)
+            # performance pragmas
+            try:
+                await self._db.execute('PRAGMA journal_mode=WAL')
+                await self._db.execute('PRAGMA synchronous=NORMAL')
+            except Exception:
+                logger.debug('Failed to set sqlite PRAGMA on %s', p, exc_info=True)
+            await self._db.execute('''
+                CREATE TABLE IF NOT EXISTS leases (
+                    mac TEXT PRIMARY KEY,
+                    ip TEXT NOT NULL,
+                    expiry INTEGER
+                )
+            ''')
+            await self._db.commit()
+            # load leases from sqlite into memory
+            try:
+                async with self._db.execute('SELECT mac, ip, expiry FROM leases') as cur:
+                    async for row in cur:
+                        mac, ip, expiry = row
+                        try:
+                            exp = int(expiry) if expiry is not None else 0
+                        except Exception:
+                            exp = 0
+                        now = int(time.time())
+                        if exp and exp < now:
+                            # expired, skip
+                            continue
+                        m = self._normalize_mac(mac)
+                        if not m:
+                            continue
+                        self.leases[m] = {'ip': ip, 'expiry': exp}
+                        self.ip_map[ip] = m
+            except Exception:
+                logger.debug('Failed to load leases from sqlite DB %s', p, exc_info=True)
+        except Exception as e:
+            logger.warning('Failed to init sqlite lease DB %s: %s', self.lease_db_path, e)
+            try:
+                if self._db:
+                    await self._db.close()
+            except Exception:
+                logger.debug('Failed to close sqlite DB after init failure', exc_info=True)
+            self._db = None
 
     def _cleanup_expired(self):
         now = int(time.time())
@@ -223,11 +334,11 @@ class DHCPServer:
                     del self.ip_map[info['ip']]
         if removed:
             logger.debug("Cleaned expired leases: %s", removed)
-            # persist
+            # persist (async if running inside event loop)
             try:
-                self._save_leases()
+                self._maybe_async_save()
             except Exception:
-                pass
+                logger.debug('Failed to persist cleaned expired leases', exc_info=True)
 
     def next_free_ip(self) -> Optional[str]:
         start = ip_to_int(self.start_ip)
@@ -268,28 +379,72 @@ class DHCPServer:
             info['expiry'] = now + self.lease_ttl
             self.ip_map[info['ip']] = m
             try:
-                self._save_leases()
+                self._maybe_async_save()
             except Exception:
-                pass
+                logger.debug('Failed to schedule lease save after renew', exc_info=True)
             return info['ip']
 
         # requested IP honored if available
         if requested:
             try:
-                if requested in self.ip_map:
-                    # already taken
-                    pass
+                # validate requested IP: must be a valid IPv4 string
+                try:
+                    req_i = ip_to_int(requested)
+                except Exception:
+                    req_i = None
+                valid = True
+                # must parse
+                if req_i is None:
+                    valid = False
                 else:
-                    # assign
+                    # must be within configured allocation range
+                    try:
+                        start_i = ip_to_int(self.start_ip)
+                        end_i = ip_to_int(self.end_ip)
+                        if req_i < start_i or req_i > end_i:
+                            valid = False
+                    except Exception:
+                        # if range invalid, reject requested
+                        valid = False
+                    # must not be network or broadcast address
+                    try:
+                        net_i = ip_to_int(self.subnet)
+                        bcast = ip_to_int(calc_broadcast(self.subnet, self.netmask))
+                        if req_i == net_i or req_i == bcast:
+                            valid = False
+                    except Exception:
+                        logger.debug('Failed to validate requested IP against network/broadcast: %s', requested, exc_info=True)
+                    # must not equal server IP
+                    try:
+                        if self.server_ip and requested == self.server_ip:
+                            valid = False
+                    except Exception:
+                        logger.debug('Failed to compare requested IP to server IP: %s', requested, exc_info=True)
+                    # must not conflict with static leases assigned to other MACs
+                    try:
+                        for k, ip_val in self.static_leases.items():
+                            if ip_val == requested and k != m:
+                                valid = False
+                                break
+                    except Exception:
+                        logger.debug('Failed to check requested IP against static leases: %s', requested, exc_info=True)
+                if valid:
+                    # check if assigned to another mac
+                    owner = self.ip_map.get(requested)
+                    if owner and owner != m:
+                        valid = False
+                if valid:
+                    # assign requested IP
                     self.leases[m] = {'ip': requested, 'expiry': now + self.lease_ttl}
                     self.ip_map[requested] = m
                     try:
-                        self._save_leases()
+                        self._maybe_async_save()
                     except Exception:
-                        pass
+                        logger.debug('Failed to schedule lease save after assigning requested IP %s', requested, exc_info=True)
                     return requested
+                # invalid requested -> ignore and fall through to normal allocation
             except Exception:
-                pass
+                logger.debug('Exception while processing requested IP %s', requested, exc_info=True)
 
         # find next free
         ip = self.next_free_ip()
@@ -297,11 +452,80 @@ class DHCPServer:
             self.leases[m] = {'ip': ip, 'expiry': now + self.lease_ttl}
             self.ip_map[ip] = m
             try:
-                self._save_leases()
+                self._maybe_async_save()
             except Exception:
-                pass
+                logger.debug('Failed to schedule lease save after automatic allocation', exc_info=True)
             return ip
         return None
+
+    def _maybe_async_save(self):
+        """Persist leases. If called inside an asyncio event loop schedule the save in a thread
+        to avoid blocking the loop; otherwise perform a synchronous save."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # no running loop -> synchronous save
+            self._save_leases()
+            return
+        # If sqlite backend present, schedule async sqlite save coroutine
+        if getattr(self, '_db', None) is not None:
+            try:
+                loop.create_task(self._save_leases_async())
+                return
+            except Exception:
+                logger.debug('Failed to schedule async sqlite save task', exc_info=True)
+        # running in event loop -> offload JSON save to thread
+        try:
+            loop.create_task(asyncio.to_thread(self._save_leases))
+        except Exception:
+            # fallback to synchronous save if scheduling fails
+            logger.debug('Failed to offload JSON save to thread; performing synchronous save', exc_info=True)
+            self._save_leases()
+
+    async def _save_leases_async(self):
+        """Persist leases to sqlite asynchronously when _db is available."""
+        if getattr(self, '_db', None) is None:
+            # nothing to do
+            return
+        # serialize sqlite writes to avoid concurrent transactions
+        try:
+            async with self._db_lock:
+                # Upsert current leases
+                try:
+                    # Begin transaction
+                    await self._db.execute('BEGIN')
+                    macs = []
+                    for mac, info in list(self.leases.items()):
+                        try:
+                            expiry = int(info.get('expiry', 0) or 0)
+                            ip = info.get('ip')
+                            # Use upsert to avoid full-table replace and races
+                            await self._db.execute(
+                                'INSERT INTO leases(mac, ip, expiry) VALUES (?, ?, ?) ON CONFLICT(mac) DO UPDATE SET ip=excluded.ip, expiry=excluded.expiry',
+                                (mac, ip, expiry)
+                            )
+                            macs.append(mac)
+                        except Exception:
+                            logger.debug('Failed to upsert lease for %s', mac, exc_info=True)
+                    # Remove rows that no longer exist in memory
+                    try:
+                        if macs:
+                            placeholders = ','.join('?' for _ in macs)
+                            await self._db.execute(f'DELETE FROM leases WHERE mac NOT IN ({placeholders})', tuple(macs))
+                        else:
+                            await self._db.execute('DELETE FROM leases')
+                    except Exception:
+                        # best-effort cleanup; log debug on error
+                        logger.debug('Failed to cleanup stale leases in sqlite', exc_info=True)
+                    await self._db.commit()
+                except Exception as e:
+                    try:
+                        await self._db.execute('ROLLBACK')
+                    except Exception:
+                        logger.debug('Failed to rollback sqlite transaction', exc_info=True)
+                    logger.debug('Failed to persist leases to sqlite: %s', e)
+        except Exception as e:
+            logger.debug('DB write serialization failed: %s', e)
 
     async def async_allocate_for_mac(self, mac: str, requested: Optional[str] = None) -> Optional[str]:
         async with self._lock:
@@ -384,18 +608,73 @@ class DHCPServer:
             if self.netmask:
                 opts[OPTION_SUBNET_MASK] = socket.inet_aton(self.netmask)
         except Exception:
-            pass
+            logger.debug('Failed to include subnet mask option', exc_info=True)
         # routers (gateway) - set to server_ip if present
         if self.server_ip:
             try:
                 opts[OPTION_ROUTER] = socket.inet_aton(self.server_ip)
             except Exception:
-                pass
+                logger.debug('Failed to include router option', exc_info=True)
         # DNS - leave empty unless provided via static_leases mapping entry (not ideal)
-        # include parameter request list if provided
+        # If client provided a Parameter Request List (option 55) we should NOT echo
+        # it back. Instead, honor only a safe subset of options requested by the
+        # client. Common and supported ones: subnet mask (1), router (3), DNS (6),
+        # lease time (51), T1 (58), T2 (59).
         if prl:
-            # prl is already bytes
-            opts[OPTION_PARAM_REQUEST_LIST] = prl
+            try:
+                allowed = {OPTION_SUBNET_MASK, OPTION_ROUTER, OPTION_DNS, OPTION_LEASE_TIME, OPTION_T1, OPTION_T2}
+                for code in prl:
+                    if code not in allowed:
+                        continue
+                    if code == OPTION_SUBNET_MASK:
+                        try:
+                            if self.netmask:
+                                opts[OPTION_SUBNET_MASK] = socket.inet_aton(self.netmask)
+                        except Exception:
+                            logger.debug('Failed to include subnet mask from PRL', exc_info=True)
+                    elif code == OPTION_ROUTER:
+                        try:
+                            if self.server_ip:
+                                opts[OPTION_ROUTER] = socket.inet_aton(self.server_ip)
+                        except Exception:
+                            logger.debug('Failed to include router from PRL', exc_info=True)
+                    elif code == OPTION_DNS:
+                        # If the server advertises DNS servers, include them. The
+                        # implementation doesn't have a dedicated dns list; check for
+                        # attribute `dns_servers` (list of IP strings) if present.
+                        try:
+                            dns_list = getattr(self, 'dns_servers', None)
+                            if dns_list:
+                                parts = []
+                                for d in dns_list:
+                                    try:
+                                        parts.append(socket.inet_aton(d))
+                                    except Exception:
+                                        logger.debug('Invalid DNS server in dns_servers: %s', d, exc_info=True)
+                                if parts:
+                                    opts[OPTION_DNS] = b''.join(parts)
+                        except Exception:
+                            logger.debug('Failed to include DNS servers from PRL', exc_info=True)
+                    elif code == OPTION_LEASE_TIME:
+                        try:
+                            opts[OPTION_LEASE_TIME] = struct.pack('>I', int(self.lease_ttl))
+                        except Exception:
+                            logger.debug('Failed to include lease time from PRL', exc_info=True)
+                    elif code == OPTION_T1:
+                        try:
+                            t1 = int(self.lease_ttl * 0.5)
+                            opts[OPTION_T1] = struct.pack('>I', t1)
+                        except Exception:
+                            logger.debug('Failed to include T1 from PRL', exc_info=True)
+                    elif code == OPTION_T2:
+                        try:
+                            t2 = int(self.lease_ttl * 0.875)
+                            opts[OPTION_T2] = struct.pack('>I', t2)
+                        except Exception:
+                            logger.debug('Failed to include T2 from PRL', exc_info=True)
+            except Exception:
+                # If anything unexpected happens, log at debug and continue
+                logger.debug('PRL handling failed', exc_info=True)
         opt_blob = self.build_options(opts)
         return pkt + opt_blob
 
@@ -409,17 +688,22 @@ class DHCPServer:
             pkt = self.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPOFFER, prl=prl, include_t1t2=True)
             # record offered IP + timestamp
             try:
-                self._offered[self._normalize_mac(chaddr)] = (ip, time.time())
+                m = self._normalize_mac(chaddr)
+                if m:
+                    self._offered[m] = (ip, time.time())
             except Exception:
-                pass
+                logger.debug('Failed to record offered IP %s for client (chaddr=%s)', ip, chaddr, exc_info=True)
             return pkt
         except Exception as e:
             logger.exception("Failed to build DHCPOFFER: %s", e)
             return None
 
     def handle_request(self, xid: int, chaddr: bytes, requested: Optional[str], prl: Optional[bytes]=None) -> Optional[bytes]:
-        mac = ':'.join('%02x' % b for b in chaddr[:6])
-        ip = self.allocate_for_mac(mac, requested)
+        # normalize MAC consistently
+        macn = self._normalize_mac(chaddr)
+        if not macn:
+            return self.build_nak(xid, chaddr)
+        ip = self.allocate_for_mac(macn, requested)
         if not ip:
             return self.build_nak(xid, chaddr)
         return self.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPACK, prl=prl, include_t1t2=True)
@@ -505,14 +789,17 @@ class DHCPServer:
                 try:
                     os.setgroups([])
                 except Exception:
-                    pass
+                    logger.debug('Failed to set supplementary groups during drop_privileges', exc_info=True)
             except Exception as e:
                 logger.warning('Failed to drop privileges: %s', e)
         except Exception as e:
             logger.error('drop_privileges helper error: %s', e)
 
     async def async_handle_request(self, xid: int, chaddr: bytes, requested: Optional[str], prl: Optional[bytes]=None) -> Optional[bytes]:
-        mac = ':'.join('%02x' % b for b in chaddr[:6])
+        # normalize MAC and use that consistently as the key
+        mac = self._normalize_mac(chaddr)
+        if not mac:
+            return self.build_nak(xid, chaddr)
         if requested:
             prev_tuple = self._offered.get(mac)
             prev = prev_tuple[0] if prev_tuple else None
@@ -534,11 +821,12 @@ class DHCPServer:
                 logger.warning('ARP conflict detected for %s; removing lease and NAKing', ip)
                 self._conflicted_ips[ip] = time.time() + 60
                 if hasattr(self, '_db') and self._db is not None:
-                    try:
-                        await self._db.execute("DELETE FROM leases WHERE ip = ?", (ip,))
-                        await self._db.commit()
-                    except Exception as e:
-                        logger.debug('Error removing conflicted lease from DB: %s', e)
+                        try:
+                            async with self._db_lock:
+                                await self._db.execute("DELETE FROM leases WHERE ip = ?", (ip,))
+                                await self._db.commit()
+                        except Exception as e:
+                            logger.debug('Error removing conflicted lease from DB: %s', e)
                 else:
                     try:
                         for m, info in list(self.leases.items()):
@@ -554,7 +842,7 @@ class DHCPServer:
         try:
             self._offered.pop(mac, None)
         except Exception:
-            pass
+            logger.debug('Failed to pop offered entry for %s', mac, exc_info=True)
         return self.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPACK, prl=prl, include_t1t2=True)
 
     async def start(self, bind_ip: str = '0.0.0.0', bind_port: int = 67):
@@ -611,7 +899,7 @@ class DHCPServer:
                     except Exception as e:
                         logger.warning('SO_BINDTODEVICE failed: %s', e)
             except Exception:
-                pass
+                logger.debug('Failed while attempting to bind socket to interface', exc_info=True)
 
             sock.bind((bind_ip, bind_port))
             logger.info('DHCP server bound to %s:%d', bind_ip, bind_port)
@@ -619,8 +907,9 @@ class DHCPServer:
             sock.close()
             try:
                 import errno
-                if hasattr(e, 'errno') and e.errno:
-                    logger.error('Failed to bind DHCP socket to %s:%d: %s (errno=%s)', bind_ip, bind_port, e, e.errno)
+                errn = getattr(e, 'errno', None)
+                if errn:
+                    logger.error('Failed to bind DHCP socket to %s:%d: %s (errno=%s)', bind_ip, bind_port, e, errn)
                 else:
                     logger.error('Failed to bind DHCP socket to %s:%d: %s', bind_ip, bind_port, e)
             except Exception:
@@ -651,7 +940,7 @@ class DHCPServer:
                         try:
                             del self._offered[m]
                         except Exception:
-                            pass
+                            logger.debug('Failed to remove stale offered entry for %s', m, exc_info=True)
             except Exception:
                 await asyncio.sleep(60)
 
@@ -676,7 +965,7 @@ class DHCPProtocol(asyncio.DatagramProtocol):
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 except Exception:
-                    pass
+                    logger.debug('Failed to set SO_BROADCAST on socket', exc_info=True)
             sock.sendto(pkt, (dst_ip, dst_port))
         except Exception as e:
             logger.exception("Failed to send DHCP packet: %s", e)
@@ -704,10 +993,27 @@ class DHCPProtocol(asyncio.DatagramProtocol):
             if not requested and ciaddr != '0.0.0.0':
                 requested = ciaddr
 
+            # Enforce rate limiting early to mitigate flooding attacks. Use the
+            # canonical normalized MAC as the bucket key.
+            try:
+                macn = self.server._normalize_mac(chaddr)
+                if not macn:
+                    logger.debug('Dropping DHCP packet with invalid MAC from %s', addr[0])
+                    return
+                try:
+                    if not self.server._allow_request(macn, addr[0]):
+                        logger.info('Rate-limited DHCP packet from %s (%s)', macn, addr[0])
+                        return
+                except Exception as e:
+                    logger.debug('Rate limit check failed: %s', e)
+            except Exception:
+                # If normalization itself fails, drop packet safely
+                logger.debug('MAC normalization failed for incoming packet from %s', addr[0])
+                return
+
             # Determine whether to broadcast the reply
             want_broadcast = bool(flags & 0x8000) or addr[0] == '0.0.0.0' or ciaddr == '0.0.0.0'
             bcast_ip = self.server.broadcast_ip or '255.255.255.255'
-
             def send_reply(pkt: bytes, yiaddr: Optional[str] = None):
                 # Try unicast to yiaddr when appropriate and possible
                 if not want_broadcast and yiaddr and yiaddr != '0.0.0.0':
@@ -715,39 +1021,92 @@ class DHCPProtocol(asyncio.DatagramProtocol):
                         self._send_packet(pkt, yiaddr, 68, broadcast=False)
                         return
                     except Exception:
-                        pass
+                        logger.debug('Failed to unicast DHCP reply to %s; falling back to broadcast', yiaddr, exc_info=True)
                 # default: broadcast
                 self._send_packet(pkt, bcast_ip, 68, broadcast=True)
 
+            # schedule async handlers so DB mutations use the server lock and don't block the protocol
             if msg_type:
                 mt = msg_type[0]
+
+                # Validate OPTION_SERVER_ID for DHCPREQUEST: if the client included a
+                # server identifier that does not match this server, ignore the
+                # request (it's meant for another DHCP server).
+                if mt == DHCPREQUEST:
+                    sid_opt = opts.get(OPTION_SERVER_ID)
+                    if sid_opt:
+                        try:
+                            sid = socket.inet_ntoa(sid_opt)
+                        except Exception:
+                            sid = None
+                        my_sid = getattr(self.server, 'server_ip', None) or self.server.get_primary_ip()
+                        if sid and my_sid and sid != my_sid:
+                            logger.debug('Ignoring DHCPREQUEST addressed to server %s (this server=%s)', sid, my_sid)
+                            return
+
                 if mt == DHCPDISCOVER:
-                    offer = self.server.handle_discover(xid, chaddr, requested, prl)
-                    if offer:
-                        yi = self.server.leases.get(self.server._normalize_mac(chaddr), {}).get('ip')
-                        send_reply(offer, yi)
-                        logger.info("Offered %s to %s (broadcast=%s)", yi, self.server._normalize_mac(chaddr), want_broadcast)
+                    async def _handle_discover():
+                        try:
+                            m = self.server._normalize_mac(chaddr) or ''
+                            ip = await self.server.async_allocate_for_mac(m, requested)
+                            if not ip:
+                                return
+                            # record offered
+                            try:
+                                if m:
+                                    self.server._offered[m] = (ip, time.time())
+                            except Exception:
+                                logger.debug('Failed to record offered IP %s for client %s', ip, m, exc_info=True)
+                            pkt = self.server.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPOFFER, prl=prl, include_t1t2=True)
+                            send_reply(pkt, ip)
+                            logger.info("Offered %s to %s (broadcast=%s)", ip, m, want_broadcast)
+                        except Exception as e:
+                            logger.exception('Error in async discover handler: %s', e)
+
+                    asyncio.create_task(_handle_discover())
+
                 elif mt == DHCPREQUEST:
-                    # very simple REQUEST handling: if we hold lease for this MAC -> ACK, else NAK
-                    macn = self.server._normalize_mac(chaddr)
-                    if macn and macn in self.server.leases:
-                        ip = self.server.leases[macn]['ip']
-                        ack = self.server.build_reply(BOOTREPLY, xid, chaddr, ip, DHCPACK, prl=prl, include_t1t2=True)
-                        send_reply(ack, ip)
-                        logger.info("ACKed %s for %s (broadcast=%s)", ip, macn, want_broadcast)
-                    else:
-                        nak = self.server.build_reply(BOOTREPLY, xid, chaddr, '0.0.0.0', DHCPNAK, prl=prl)
-                        send_reply(nak, None)
-                        logger.info("NAK for %s (broadcast=%s)", macn, want_broadcast)
+                    async def _handle_request():
+                        try:
+                            resp = await self.server.async_handle_request(xid, chaddr, requested, prl)
+                            if not resp:
+                                # build_nak if necessary
+                                nak = self.server.build_nak(xid, chaddr)
+                                send_reply(nak, None)
+                                return
+                            m2 = self.server._normalize_mac(chaddr) or ''
+                            yi = self.server.leases.get(m2, {}).get('ip')
+                            if yi is not None:
+                                yi = str(yi)
+                            send_reply(resp, yi)
+                            logger.info('Processed DHCPREQUEST for %s (broadcast=%s)', self.server._normalize_mac(chaddr), want_broadcast)
+                        except Exception as e:
+                            logger.exception('Error in async request handler: %s', e)
+
+                    asyncio.create_task(_handle_request())
+
                 elif mt == DHCPRELEASE:
-                    macn = self.server._normalize_mac(chaddr)
-                    if macn and macn in self.server.leases:
-                        ip = self.server.leases[macn]['ip']
-                        del self.server.leases[macn]
-                        if ip in self.server.ip_map:
-                            del self.server.ip_map[ip]
-                        self.server._save_leases()
-                        logger.info("Released %s from %s", ip, macn)
+                    async def _handle_release():
+                        try:
+                            macn = self.server._normalize_mac(chaddr)
+                            if not macn:
+                                return
+                            async with self.server._lock:
+                                if macn in self.server.leases:
+                                    ip = self.server.leases[macn]['ip']
+                                    del self.server.leases[macn]
+                                    if ip in self.server.ip_map:
+                                        del self.server.ip_map[ip]
+                                    # persist in a thread to avoid blocking the loop
+                                    try:
+                                        await asyncio.to_thread(self.server._save_leases)
+                                    except Exception as e:
+                                        logger.debug('Error saving leases after release: %s', e)
+                                    logger.info('Released %s from %s', ip, macn)
+                        except Exception as e:
+                            logger.exception('Error in async release handler: %s', e)
+
+                    asyncio.create_task(_handle_release())
         except Exception as e:
             logger.exception("DHCP datagram handling failed: %s", e)
 
