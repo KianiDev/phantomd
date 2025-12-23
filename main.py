@@ -5,8 +5,8 @@ import asyncio
 from core.dserver import run_server
 from utils.ListUpdater import fetch_blocklists_sync
 
-# DHCP import will be performed lazily only if enabled so incomplete DHCP modules don't break startup
-from core.phantomd_dhcp import DHCPServer
+# NOTE: don't import DHCP at module import time. Import lazily when enabled so
+# incomplete DHCP-related optional deps don't break the whole process.
 
 def main():
     parser = argparse.ArgumentParser(description="phantomd DNS server")
@@ -35,13 +35,9 @@ def main():
         except Exception as e:
             logging.warning(f"Initial blocklist fetch failed: {e}")
 
-    # Prepare coroutines
-    dns_coro = run_server(
-        config["listen_ip"],
-        config["listen_port"],
-        config["upstream_dns"],
-        config["protocol"],
-        dns_resolver_server=config.get("dns_resolver_server"),
+    # Prepare server parameters (we will start tasks inside the event loop)
+    server_kwargs = dict(
+        dns_resolver_server=config.get("dns_resolver_server", ""),
         verbose=verbose,
         blocklists=block_cfg,
         disable_ipv6=config.get("disable_ipv6", False),
@@ -51,17 +47,41 @@ def main():
         dns_log_retention_days=config.get("dns_log_retention_days", 7),
         dns_log_dir=config.get("dns_log_dir", "/var/log/phantomd"),
         dns_log_prefix=config.get("dns_log_prefix", "dns-log"),
-        dns_pinned_certs=config.get("dns_pinned_certs"),
+        dns_pinned_certs=config.get("dns_pinned_certs") or {},
         dnssec_enabled=config.get("dnssec_enabled", False),
-        trust_anchors_file=config.get("trust_anchors_file"),
+        trust_anchors_file=config.get("trust_anchors_file", ""),
         metrics_enabled=config.get("metrics_enabled", False),
         uvloop_enable=config.get("uvloop_enable", False),
     )
+    # coerce typed local variables to avoid static typing confusion
+    dns_resolver_server = str(config.get("dns_resolver_server") or "")
+    verbose_flag = bool(verbose)
+    blocklists_cfg = block_cfg or {}
+    disable_ipv6_flag = bool(config.get("disable_ipv6", False))
+    dns_cache_ttl_val = int(config.get("dns_cache_ttl", 300))
+    dns_cache_max_size_val = int(config.get("dns_cache_max_size", 1024))
+    dns_logging_enabled_flag = bool(config.get("dns_logging_enabled", False))
+    dns_log_retention_days_val = int(config.get("dns_log_retention_days", 7))
+    dns_log_dir_str = str(config.get("dns_log_dir", "/var/log/phantomd"))
+    dns_log_prefix_str = str(config.get("dns_log_prefix", "dns-log"))
+    dns_pinned_certs_dict = config.get("dns_pinned_certs") or {}
+    dnssec_enabled_flag = bool(config.get("dnssec_enabled", False))
+    trust_anchors_file_str = str(config.get("trust_anchors_file") or "")
+    metrics_enabled_flag = bool(config.get("metrics_enabled", False))
+    uvloop_enable_flag = bool(config.get("uvloop_enable", False))
 
     dhcp_cfg = config.get('dhcp', {})
-    dhcp_coro = None
+    dhcp_start_fn = None
     if dhcp_cfg.get('enabled'):
-        _dh = DHCPServer
+        # lazy import to avoid import-time failures when optional deps are missing
+        try:
+            from core.phantomd_dhcp import DHCPServer as _DHCPImpl
+        except Exception as e:
+            logging.warning("DHCP enabled in config but DHCP module failed to import; skipping DHCP startup: %s", e)
+            _dh = None
+        else:
+            _dh = _DHCPImpl
+
         if _dh is None:
             logging.warning("DHCP enabled in config but no DHCPServer implementation available; skipping DHCP startup")
         else:
@@ -76,20 +96,54 @@ def main():
                     server_ip=None,
                     lease_db_path=dhcp_cfg.get('lease_db_path')
                 )
-                # support either start() coroutine or other common entrypoints; prefer start()
-                start_fn = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
-                if callable(start_fn):
-                    dhcp_coro = start_fn()
-                else:
+                # don't start yet; store start function to call inside event loop
+                dhcp_start_fn = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
+                if not callable(dhcp_start_fn):
                     logging.warning('DHCP server has no known start method; skipping DHCP startup')
+                    dhcp_start_fn = None
             except Exception as e:
-                logging.exception("Failed to start DHCP server: %s", e)
+                logging.exception("Failed to initialize DHCP server: %s", e)
 
     async def _run_all():
-        if dhcp_coro:
-            await asyncio.gather(dns_coro, dhcp_coro)
+        # start DNS server and optional DHCP server as tasks
+        dns_task = asyncio.create_task(run_server(
+            config["listen_ip"],
+            config["listen_port"],
+            config["upstream_dns"],
+            config["protocol"],
+            dns_resolver_server=dns_resolver_server,
+            verbose=verbose_flag,
+            blocklists=blocklists_cfg,
+            disable_ipv6=disable_ipv6_flag,
+            dns_cache_ttl=dns_cache_ttl_val,
+            dns_cache_max_size=dns_cache_max_size_val,
+            dns_logging_enabled=dns_logging_enabled_flag,
+            dns_log_retention_days=dns_log_retention_days_val,
+            dns_log_dir=dns_log_dir_str,
+            dns_log_prefix=dns_log_prefix_str,
+            dns_pinned_certs=dns_pinned_certs_dict,
+            dnssec_enabled=dnssec_enabled_flag,
+            trust_anchors_file=trust_anchors_file_str,
+            metrics_enabled=metrics_enabled_flag,
+            uvloop_enable=uvloop_enable_flag,
+        ))
+
+        dhcp_task = None
+        if dhcp_start_fn:
+            try:
+                res = dhcp_start_fn()
+                if asyncio.iscoroutine(res):
+                    dhcp_task = asyncio.create_task(res)
+                else:
+                    # start_fn may return an awaitable or start background work; wrap safely
+                    dhcp_task = asyncio.create_task(asyncio.to_thread(lambda: res))
+            except Exception as e:
+                logging.exception("Failed to start DHCP task: %s", e)
+
+        if dhcp_task:
+            await asyncio.gather(dns_task, dhcp_task)
         else:
-            await dns_coro
+            await dns_task
 
     asyncio.run(_run_all())
 

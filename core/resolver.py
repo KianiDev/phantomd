@@ -15,6 +15,7 @@ try:
     _HAS_CACHETOOLS = True
 except Exception:
     _HAS_CACHETOOLS = False
+    TTLCache = None
 
 try:
     import aioquic.asyncio
@@ -22,6 +23,7 @@ try:
     _HAS_AIOQUIC = True
 except Exception:
     aioquic = None
+    QuicConfiguration = None
     _HAS_AIOQUIC = False
 
 # optional prometheus
@@ -29,6 +31,8 @@ try:
     from prometheus_client import Counter, Histogram
     _HAS_PROM = True
 except Exception:
+    Counter = None
+    Histogram = None
     _HAS_PROM = False
 
 # optional dnspython for DNSSEC
@@ -40,6 +44,7 @@ try:
     import dns.rdatatype
     _HAS_DNSPY = True
 except Exception:
+    dns = None
     _HAS_DNSPY = False
 
 # optional uvloop helper (not auto-enabled)
@@ -47,6 +52,7 @@ try:
     import uvloop
     _HAS_UVLOOP = True
 except Exception:
+    uvloop = None
     _HAS_UVLOOP = False
 
 
@@ -881,9 +887,9 @@ class DNSResolver:
                 except Exception as e:
                     if not on_response.done():
                         on_response.set_exception(e)
-            def datagram_received(self, b, addr):
+            def datagram_received(self, data, addr):
                 if not on_response.done():
-                    on_response.set_result(b)
+                    on_response.set_result(data)
             def error_received(self, exc):
                 if not on_response.done():
                     on_response.set_exception(exc)

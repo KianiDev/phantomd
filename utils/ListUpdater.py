@@ -1,7 +1,7 @@
 import os
 import sys
+import logging
 import requests
-import aiohttp
 import asyncio
 
 from urllib.parse import urlparse
@@ -47,13 +47,17 @@ def fetch_blocklists_sync(urls, destination_dir='blocklists'):
             else:
                 results.append((raw, False))
         except Exception as e:
-            print(f"Failed to fetch {raw}: {e}")
+            logging.warning("Failed to fetch %s: %s", raw, e)
             results.append((raw, False))
     return results
 
 
 async def fetch_blocklists(urls, destination_dir='blocklists'):
     """Async fetch using aiohttp. Returns list of (source, True/False)."""
+    try:
+        import aiohttp
+    except Exception:
+        raise RuntimeError("aiohttp is not installed; install aiohttp to use async blocklist fetching")
     if isinstance(urls, str):
         urls = [u.strip() for u in urls.split(',') if u.strip()]
     os.makedirs(destination_dir, exist_ok=True)
@@ -75,7 +79,7 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
                         results.append((raw, True))
 
                 except Exception as e:
-                    print(f"Failed to fetch {raw}: {e}")
+                    logging.warning("Failed to fetch %s: %s", raw, e)
                     results.append((raw, False))
             elif parsed.scheme == '':
                 if os.path.exists(raw):
@@ -84,7 +88,7 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
                             fw.write(fr.read())
                         results.append((raw, True))
                     except Exception as e:
-                        print(f"Failed to copy local blocklist {raw}: {e}")
+                        logging.warning("Failed to copy local blocklist %s: %s", raw, e)
                         results.append((raw, False))
                 else:
                     results.append((raw, False))
@@ -100,7 +104,11 @@ async def periodic_fetch(urls, interval_seconds=86400, destination_dir='blocklis
 
 
 def start_periodic_fetch_in_background(urls, interval_seconds=86400, destination_dir='blocklists'):
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # no running loop; fall back to get_event_loop for compatibility
+        loop = asyncio.get_event_loop()
     # schedule the coroutine in background
     loop.create_task(periodic_fetch(urls, interval_seconds, destination_dir))
 

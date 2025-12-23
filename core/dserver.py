@@ -177,16 +177,42 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
 
     loop = asyncio.get_running_loop()
 
-    # load blocklists
+    # load blocklists: perform initial fetch then load from directory and schedule periodic refresh
     global BLOCK_ACTION
     if blocklists:
         BLOCK_ACTION = blocklists.get('action', BLOCK_ACTION_NX)
-        exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir('blocklists')
-        domains = list(exact_set) + ['.' + s for s in suffix_set]
-        resolver.set_blocklist(domains)
-        resolver.set_hosts_map(hosts_map)
-        # inform resolver of the configured runtime block action so it can synthesize responses
-        resolver.set_block_action(BLOCK_ACTION)
+        urls = blocklists.get('urls', []) or []
+        # allow config to override local storage dir
+        local_dir = blocklists.get('local_blocklist_dir', 'blocklists')
+
+        # If remote urls configured, try to fetch them first so load picks up fresh data
+        if urls:
+            try:
+                # fetch_blocklists is async and will write files into destination_dir
+                await fetch_blocklists(urls, destination_dir=local_dir)
+                logging.info("Initial blocklist fetch complete")
+            except Exception as e:
+                logging.warning("Initial async blocklist fetch failed: %s", e)
+
+        # load whatever blocklists are present on disk
+        try:
+            exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
+            domains = list(exact_set) + ['.' + s for s in suffix_set]
+            resolver.set_blocklist(domains)
+            resolver.set_hosts_map(hosts_map)
+            # inform resolver of the configured runtime block action so it can synthesize responses
+            resolver.set_block_action(BLOCK_ACTION)
+        except Exception as e:
+            logging.warning("Failed to load blocklists from %s: %s", local_dir, e)
+
+        # schedule periodic refresh if enabled
+        if blocklists.get('enabled') and urls:
+            interval = blocklists.get('interval_seconds', 86400)
+            try:
+                loop.create_task(periodic_fetch(urls, interval_seconds=interval, destination_dir=local_dir))
+                logging.info("Scheduled periodic blocklist refresh every %s seconds", interval)
+            except Exception as e:
+                logging.warning("Failed to schedule periodic blocklist refresh: %s", e)
 
     # UDP listener
     udp_transport, _ = await loop.create_datagram_endpoint(
