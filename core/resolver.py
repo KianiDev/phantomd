@@ -428,17 +428,20 @@ class DNSResolver:
             return None
 
     def _make_nxdomain_response(self, query_data: bytes) -> bytes:
-        """Return NXDOMAIN wire response preserving TID and question section."""
+        """Return NXDOMAIN wire response preserving TID, question section and RD flag.
+
+        Preserve the client's Recursion Desired (RD) flag in the reply while setting
+        QR=1 and RCODE=3 (NXDOMAIN). Question section is copied safely.
+        """
         if not query_data or len(query_data) < 12:
-            # fallback: minimal header with random tid
             tid = 0
             qpart = b''
+            req_flags = 0
         else:
             tid = int.from_bytes(query_data[0:2], 'big')
+            req_flags = int.from_bytes(query_data[2:4], 'big')
             # copy question (from byte 12 to end of question section)
-            # we must find end of qname and include qtype/qclass (4 bytes)
             try:
-                # reuse skip
                 def _skip_name(resp, offset, depth=0):
                     if depth > 40:
                         raise Exception("pointer loop")
@@ -452,12 +455,21 @@ class DNSResolver:
                             return offset + 2
                         offset += 1 + l
                 qend = _skip_name(query_data, 12)
-                qpart = query_data[12:qend + 4]  # name + qtype(2)+qclass(2)
+                # include qtype(2) + qclass(2)
+                qpart = query_data[12:qend + 4]
             except Exception:
-                qpart = query_data[12:]  # best-effort
-        # Build header: QR=1 (0x8000), RCODE=3 (NXDOMAIN => add 3) => flags = 0x8000 | 3 = 0x8003
-        flags = 0x8000 | 3
-        header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
+                qpart = query_data[12:]
+        # Preserve RD bit from request (0x0100), set QR (0x8000) and RCODE=3 (NXDOMAIN)
+        rd = req_flags & 0x0100
+        flags = 0x8000 | rd | 0x0003
+        header = (
+            tid.to_bytes(2, 'big') +
+            flags.to_bytes(2, 'big') +
+            (1).to_bytes(2, 'big') +  # QDCOUNT
+            (0).to_bytes(2, 'big') +  # ANCOUNT
+            (0).to_bytes(2, 'big') +  # NSCOUNT
+            (0).to_bytes(2, 'big')    # ARCOUNT
+        )
         return header + qpart
 
     def _extract_min_ttl(self, response: bytes) -> int:
@@ -815,8 +827,12 @@ class DNSResolver:
         # blocklist check
         if self.is_blocked(qname):
             self._log_event("Blocked (internal)", qname, None, "blocklist")
-            # return NXDOMAIN preserving TID/question
-            return self._make_nxdomain_response(data)
+            # return configured block action (NXDOMAIN/REFUSED/ZEROIP) while preserving TID/question
+            try:
+                return self.build_block_response(data)
+            except Exception:
+                # fallback to NXDOMAIN on any unexpected error while building block response
+                return self._make_nxdomain_response(data)
 
         # check wire cache
         cached = await self._wire_cache_get_valid(key)
@@ -1058,12 +1074,13 @@ class DNSResolver:
                 return bytes(body)
             else:
                 if content_length is None:
-                    # no content-length, read until EOF
-                    body = await asyncio.wait_for(reader.read(), timeout=self.doh_timeout)
-                    return body
-                else:
-                    body = await asyncio.wait_for(reader.readexactly(content_length), timeout=self.doh_timeout)
-                    return body
+                    # Prefer deterministic behavior: require Content-Length for DoH responses
+                    # Reading until EOF can hang if the server keeps the connection open.
+                    self.logger.warning("DoH response missing Content-Length and not chunked; rejecting for determinism")
+                    raise Exception("DoH response missing Content-Length and not chunked")
+                # read exact content-length bytes
+                body = await asyncio.wait_for(reader.readexactly(content_length), timeout=self.doh_timeout)
+                return body
         finally:
             writer.close()
             await writer.wait_closed()
