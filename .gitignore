@@ -4,6 +4,7 @@ __pycache__/
 *.pem
 *.crt
 *.key
-.env
+.venv
 config/certs/
 .vscode/
+.pytest_cache

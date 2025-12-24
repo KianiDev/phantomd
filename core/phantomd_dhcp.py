@@ -122,6 +122,25 @@ class DHCPServer:
         # optional sqlite DB handle (set by _init_db if used)
         self._db = None
 
+        # persistence backend selection: 'json', 'sqlite', or 'none'
+        # Default chosen from lease_db_path: .sqlite -> attempt sqlite, otherwise JSON.
+        self.lease_backend = 'none'
+        try:
+            p = str(self.lease_db_path) if self.lease_db_path else ''
+        except Exception:
+            p = ''
+        if not p:
+            self.lease_backend = 'none'
+        elif p.lower().endswith('.sqlite'):
+            # prefer sqlite but may fall back later if aiosqlite missing or init fails
+            if aiosqlite is not None:
+                self.lease_backend = 'sqlite'
+            else:
+                logger.warning('lease_db_path ends with .sqlite but aiosqlite not available; falling back to JSON')
+                self.lease_backend = 'json'
+        else:
+            self.lease_backend = 'json'
+
         # concurrency
         self._lock = asyncio.Lock()
         # sqlite write serialization lock
@@ -151,7 +170,7 @@ class DHCPServer:
         # Try to close sqlite DB cleanly and fallback to saving JSON leases
         try:
             db = getattr(self, '_db', None)
-            if db is not None:
+            if self.lease_backend == 'sqlite' and db is not None:
                 try:
                     # If there is no running event loop we can safely run the
                     # coroutine to close the DB. If an event loop is running,
@@ -183,10 +202,36 @@ class DHCPServer:
                     logger.debug('Unexpected error during finalize DB close', exc_info=True)
         except Exception:
             logger.debug('Unexpected error entering finalize()', exc_info=True)
+        # Persist leases depending on selected backend
         try:
-            self._save_leases()
+            if self.lease_backend == 'sqlite':
+                # schedule a final save if DB is present
+                try:
+                    if getattr(self, '_db', None) is not None:
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            # no running loop -> run close synchronously
+                            try:
+                                asyncio.run(self._save_leases_async())
+                            except Exception:
+                                logger.debug('Failed to run sqlite save during finalize', exc_info=True)
+                        else:
+                            try:
+                                asyncio.run_coroutine_threadsafe(self._save_leases_async(), loop)
+                            except Exception:
+                                logger.debug('Failed to schedule sqlite save during finalize', exc_info=True)
+                except Exception:
+                    logger.debug('Error while attempting final sqlite save', exc_info=True)
+            elif self.lease_backend == 'json':
+                try:
+                    self._save_leases()
+                except Exception:
+                    logger.debug('Failed to save leases during finalize', exc_info=True)
+            else:
+                logger.debug('No lease backend configured during finalize; nothing to persist')
         except Exception:
-            logger.debug('Failed to save leases during finalize', exc_info=True)
+            logger.debug('Unexpected error during finalize persistence', exc_info=True)
 
     def _normalize_mac(self, mac) -> Optional[str]:
         if mac is None:
@@ -209,14 +254,14 @@ class DHCPServer:
 
     def _load_leases(self):
         # JSON-backed simple storage
+        # Only load JSON when backend is configured for JSON persistence
+        if self.lease_backend != 'json':
+            return
         try:
             p = str(self.lease_db_path) if self.lease_db_path else ''
         except Exception:
             p = ''
-        # if using sqlite backend, skip JSON loading
-        if p.lower().endswith('.sqlite'):
-            return
-        if not self.lease_db_path:
+        if not p:
             return
         try:
             if os.path.exists(self.lease_db_path):
@@ -260,7 +305,13 @@ class DHCPServer:
 
     async def _init_db(self):
         # Initialize sqlite backend when requested (lease_db_path should point to a .sqlite file)
+        # Only initialize sqlite when backend selection indicates sqlite
+        if self.lease_backend != 'sqlite':
+            return
         if aiosqlite is None:
+            logger.warning('aiosqlite not available; cannot initialize sqlite backend')
+            # fallback to json backend
+            self.lease_backend = 'json'
             return
         if not self.lease_db_path:
             return
@@ -270,6 +321,9 @@ class DHCPServer:
         except Exception:
             return
         if not p.lower().endswith('.sqlite'):
+            # path doesn't look like sqlite; fallback to json
+            logger.debug('lease_db_path does not end with .sqlite; skipping sqlite init')
+            self.lease_backend = 'json'
             return
         # ensure directory exists
         try:
@@ -322,6 +376,8 @@ class DHCPServer:
             except Exception:
                 logger.debug('Failed to close sqlite DB after init failure', exc_info=True)
             self._db = None
+            # on failure, fall back to json backend
+            self.lease_backend = 'json'
 
     def _cleanup_expired(self):
         now = int(time.time())
@@ -467,24 +523,30 @@ class DHCPServer:
             # no running loop -> synchronous save
             self._save_leases()
             return
-        # If sqlite backend present, schedule async sqlite save coroutine
-        if getattr(self, '_db', None) is not None:
+        # If sqlite backend selected and DB handle present, schedule async sqlite save coroutine
+        if self.lease_backend == 'sqlite' and getattr(self, '_db', None) is not None:
             try:
                 loop.create_task(self._save_leases_async())
                 return
             except Exception:
                 logger.debug('Failed to schedule async sqlite save task', exc_info=True)
         # running in event loop -> offload JSON save to thread
-        try:
-            loop.create_task(asyncio.to_thread(self._save_leases))
-        except Exception:
-            # fallback to synchronous save if scheduling fails
-            logger.debug('Failed to offload JSON save to thread; performing synchronous save', exc_info=True)
-            self._save_leases()
+        if self.lease_backend == 'json':
+            try:
+                loop.create_task(asyncio.to_thread(self._save_leases))
+            except Exception:
+                # fallback to synchronous save if scheduling fails
+                logger.debug('Failed to offload JSON save to thread; performing synchronous save', exc_info=True)
+                self._save_leases()
+            return
+        # lease_backend == 'none' -> nothing to do
+        logger.debug('No lease backend configured; skipping save')
+        
 
     async def _save_leases_async(self):
         """Persist leases to sqlite asynchronously when _db is available."""
-        if getattr(self, '_db', None) is None:
+        # Only operate when sqlite backend is selected
+        if self.lease_backend != 'sqlite' or getattr(self, '_db', None) is None:
             # nothing to do
             return
         # serialize sqlite writes to avoid concurrent transactions

@@ -17,6 +17,7 @@ h3>=0.13.0
 
 # Utilities
 requests>=2.31.0
+scapy>=2.6.1
 
 # Development / testing packages have been intentionally removed from this file.
 # If you are developing or running tests install them separately, for example:
