@@ -124,6 +124,7 @@ class DNSResolver:
                   dnssec_enabled: bool = False,
                   trust_anchors: Optional[dict] = None,
                   metrics_enabled: bool = False,
+                  metrics_port: int = 8000,
                   uvloop_enable: bool = False):
         self.upstream_dns = upstream_dns
         self.protocol = protocol.lower()
@@ -193,8 +194,11 @@ class DNSResolver:
                 # attempt to start a local metrics HTTP server on localhost:8000
                 try:
                     from prometheus_client import start_http_server
-                    start_http_server(8000)
-                    self.logger.info("Prometheus metrics server started on :8000")
+                    try:
+                        start_http_server(int(metrics_port))
+                        self.logger.info("Prometheus metrics server started on :%s", metrics_port)
+                    except Exception as e:
+                        self.logger.debug("Could not start prometheus http server on %s: %s", metrics_port, e)
                 except Exception as e:
                     self.logger.debug("Could not start prometheus http server: %s", e)
             except Exception:

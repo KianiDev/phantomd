@@ -878,7 +878,10 @@ class DHCPServer:
             logger.info('Failed to allocate IP for %s', mac)
             return self.build_nak(xid, chaddr)
         try:
-            conflict = await self._arp_conflict_async(ip)
+            if getattr(self, 'arp_probe_enable', True):
+                conflict = await self._arp_conflict_async(ip, timeout=getattr(self, 'arp_probe_timeout', 1))
+            else:
+                conflict = False
             if conflict:
                 logger.warning('ARP conflict detected for %s; removing lease and NAKing', ip)
                 self._conflicted_ips[ip] = time.time() + 60
@@ -911,6 +914,15 @@ class DHCPServer:
         loop = asyncio.get_running_loop()
         self.loop = loop
         try:
+            # honor explicit disable for sqlite backend if configured
+            try:
+                if getattr(self, 'lease_sqlite_enabled', True) is False:
+                    p = str(self.lease_db_path) if self.lease_db_path else ''
+                    if p.lower().endswith('.sqlite'):
+                        logger.info('lease_sqlite_enabled is false; forcing JSON backend instead of sqlite')
+                        self.lease_backend = 'json'
+            except Exception:
+                pass
             await self._init_db()
         except Exception as e:
             logger.debug('DB init failed: %s', e)
@@ -979,7 +991,11 @@ class DHCPServer:
             logger.error('If you are testing, try a non-privileged port like 6767 or run with appropriate privileges')
             raise
         try:
-            self.drop_privileges(user='nobody')
+            # honor configured privilege drop settings if present on the instance
+            user = getattr(self, 'privilege_drop_user', 'nobody') or 'nobody'
+            group = getattr(self, 'privilege_drop_group', None)
+            chroot_dir = getattr(self, 'chroot_dir', None) or None
+            self.drop_privileges(user=user, group=group, chroot_dir=chroot_dir)
         except Exception:
             logger.debug('drop_privileges failed or not applicable')
         transport, protocol = await loop.create_datagram_endpoint(lambda: DHCPProtocol(self), sock=sock)
