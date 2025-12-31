@@ -34,5 +34,8 @@ A lightweight, modular DNS proxy with filtering and secure upstream support.
 ## 🤝 Contributing
 Pull requests are welcome! For major changes, open an issue first to discuss what you would like to change.
 
+## ⚠️ Beta Notice
+This project is still in beta. I am actively working on it currently whenever I have free time, but in general, I don't consider it ready for usage.
+
 ## 📜 License
 MIT License — free to use, modify, and share.
