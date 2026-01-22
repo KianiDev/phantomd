@@ -1,4 +1,6 @@
 from utils.config import load_config
+import os
+import sys
 import argparse
 import logging
 import asyncio
@@ -16,6 +18,23 @@ def main():
     config = load_config()
     verbose = args.verbose or config.get("verbose", False)
 
+    # honor listen_loopback_only: override listen_ip to localhost when requested
+    listen_loopback = bool(config.get('listen_loopback_only', False))
+    listen_ip_cfg = config.get('listen_ip')
+    if listen_loopback:
+        listen_ip_cfg = '127.0.0.1'
+
+    # privileged bind requirement check
+    require_priv = bool(config.get('require_privileged_bind', False))
+    listen_port_cfg = int(config.get('listen_port', 53))
+    if require_priv and listen_port_cfg < 1024:
+        try:
+            if hasattr(os, 'geteuid') and os.geteuid() != 0:
+                logging.error('Config requires privileged bind but process is not running as root. Exiting.')
+                sys.exit(1)
+        except Exception:
+            logging.warning('Unable to verify privileges on this platform; ensure process has permission to bind privileged ports.')
+
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format='[%(levelname)s] %(message)s')
     logging.info("Configuration loaded successfully:")
@@ -28,7 +47,8 @@ def main():
         urls = block_cfg.get('urls', [])
         # perform initial synchronous fetch (wait), warn on failure
         try:
-            results = fetch_blocklists_sync(urls)
+            dest_dir = block_cfg.get('local_blocklist_dir', 'blocklists')
+            results = fetch_blocklists_sync(urls, destination_dir=dest_dir)
             failed = [src for src, ok in results if not ok]
             if failed:
                 logging.warning(f"Some blocklist sources failed to fetch: {failed}")
@@ -96,19 +116,46 @@ def main():
                     server_ip=None,
                     lease_db_path=dhcp_cfg.get('lease_db_path')
                 )
+                # configure DHCP instance with extra runtime options parsed from config
+                try:
+                    dhcp.arp_probe_enable = bool(config.get('dhcp_arp_probe_enable', True))
+                    dhcp.arp_probe_timeout = int(config.get('dhcp_arp_probe_timeout', 1))
+                    dhcp.privilege_drop_user = config.get('dhcp_privilege_drop_user', 'nobody')
+                    dhcp.privilege_drop_group = config.get('dhcp_privilege_drop_group', '')
+                    dhcp.chroot_dir = config.get('dhcp_chroot_dir', '')
+                    dhcp.test_bind_port = int(config.get('dhcp_test_bind_port', 67))
+                    dhcp.lease_sqlite_enabled = bool(config.get('lease_sqlite_enabled', True))
+                    dhcp.lease_sqlite_path = config.get('lease_sqlite_path', '/var/lib/phantomd/dhcp_leases.sqlite')
+                    # rate limiting
+                    try:
+                        dhcp.rate_limit_rps = float(dhcp_cfg.get('rate_limit_rps', config.get('dhcp_rate_limit_rps', 5.0)))
+                    except Exception:
+                        dhcp.rate_limit_rps = float(config.get('dhcp_rate_limit_rps', 5.0))
+                    try:
+                        dhcp.rate_limit_burst = float(dhcp_cfg.get('rate_limit_burst', config.get('dhcp_rate_limit_burst', 20)))
+                    except Exception:
+                        dhcp.rate_limit_burst = float(config.get('dhcp_rate_limit_burst', 20))
+                except Exception:
+                    logging.debug('Failed to set DHCP runtime attributes from config', exc_info=True)
+
                 # don't start yet; store start function to call inside event loop
-                dhcp_start_fn = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
-                if not callable(dhcp_start_fn):
+                # We wrap start to pass bind_ip and bind_port based on config
+                start_fn = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
+                if not callable(start_fn):
                     logging.warning('DHCP server has no known start method; skipping DHCP startup')
                     dhcp_start_fn = None
+                else:
+                    bind_ip = listen_ip_cfg
+                    bind_port = int(config.get('dhcp_test_bind_port', 67))
+                    dhcp_start_fn = lambda: start_fn(bind_ip, bind_port)
             except Exception as e:
                 logging.exception("Failed to initialize DHCP server: %s", e)
 
     async def _run_all():
         # start DNS server and optional DHCP server as tasks
         dns_task = asyncio.create_task(run_server(
-            config["listen_ip"],
-            config["listen_port"],
+            listen_ip_cfg,
+            listen_port_cfg,
             config["upstream_dns"],
             config["protocol"],
             dns_resolver_server=dns_resolver_server,
@@ -125,7 +172,13 @@ def main():
             dnssec_enabled=dnssec_enabled_flag,
             trust_anchors_file=trust_anchors_file_str,
             metrics_enabled=metrics_enabled_flag,
+            metrics_port=int(config.get('metrics_port', 8000)),
             uvloop_enable=uvloop_enable_flag,
+            upstream_retries=int(config.get('upstream_retries', 2)),
+            upstream_initial_backoff=float(config.get('upstream_initial_backoff', 0.1)),
+            upstream_udp_timeout=float(config.get('upstream_udp_timeout', 2.0)),
+            upstream_tcp_timeout=float(config.get('upstream_tcp_timeout', 5.0)),
+            upstream_doh_timeout=float(config.get('upstream_doh_timeout', 5.0)),
         ))
 
         dhcp_task = None

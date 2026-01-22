@@ -151,7 +151,7 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             pass
 
 
-async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False, dns_cache_ttl: int = 300, dns_cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log', dns_pinned_certs: dict = None, dnssec_enabled: bool = False, trust_anchors_file: str = None, metrics_enabled: bool = False, uvloop_enable: bool = False):
+async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str, dns_resolver_server: str = None, verbose: bool = False, blocklists: dict = None, disable_ipv6: bool = False, dns_cache_ttl: int = 300, dns_cache_max_size: int = 1024, dns_logging_enabled: bool = False, dns_log_retention_days: int = 7, dns_log_dir: str = '/var/log/phantomd', dns_log_prefix: str = 'dns-log', dns_pinned_certs: dict = None, dnssec_enabled: bool = False, trust_anchors_file: str = None, metrics_enabled: bool = False, metrics_port: int = 8000, uvloop_enable: bool = False, upstream_retries: int = 2, upstream_initial_backoff: float = 0.1, upstream_udp_timeout: float = 2.0, upstream_tcp_timeout: float = 5.0, upstream_doh_timeout: float = 5.0):
     # explicit cache and logging parameters are now function args (defaults provided)
 
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -165,6 +165,10 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         disable_ipv6=disable_ipv6,
         cache_ttl=dns_cache_ttl,
         cache_max_size=dns_cache_max_size,
+        doh_timeout=upstream_doh_timeout,
+        udp_timeout=upstream_udp_timeout,
+        tcp_timeout=upstream_tcp_timeout,
+        retries=upstream_retries,
         dns_logging_enabled=dns_logging_enabled,
         dns_log_dir=dns_log_dir,
         # optional features - enable via configuration if desired
@@ -172,6 +176,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         dnssec_enabled=dnssec_enabled,
         trust_anchors=None if not trust_anchors_file else {'file': trust_anchors_file},
         metrics_enabled=metrics_enabled,
+        metrics_port=metrics_port,
         uvloop_enable=uvloop_enable,
     )
 
