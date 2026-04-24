@@ -56,8 +56,8 @@ else
 fi
 
 # try to install some OS-level helper packages if apt is available
-if command -v apt >/dev/null 2>&1; then
-  echo "Installing minimal runtime packages via apt..."
+if command -v apt-get >/dev/null 2>&1; then
+  echo "Installing minimal runtime packages via apt-get..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y || true
   # Install only minimal runtime helpers. Do not install heavy build toolchains here.
@@ -110,6 +110,9 @@ systemctl enable "$SERVICE_NAME" || true
 
 # Interactive config generation (headless prompts)
 CONFIG_FILE="$INSTALL_DIR/config/phantomd.conf"
+# Ensure the config directory exists
+mkdir -p "$(dirname "$CONFIG_FILE")"
+
 if [ ! -f "$CONFIG_FILE" ]; then
   cat > "$CONFIG_FILE" <<'EOF'
 [upstream]
@@ -156,19 +159,32 @@ fi
 
 echo "Configuration template written to $CONFIG_FILE"
 
+# Utility function to safely escape a value for use in a sed substitution
+# (escapes '/' and '&')
+escape_sed() {
+  printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
 # Guide user through options
 echo "Configuring phantomd. Press ENTER to accept the shown default in []"
 read -r -p "Upstream DNS (ip or host) [1.1.1.1]: " INPUT; INPUT=${INPUT:-1.1.1.1}
-sed -i "s/^dns_server =.*$/dns_server = $INPUT/" "$CONFIG_FILE"
+INPUT_ESC="$(escape_sed "$INPUT")"
+sed -i "s/^dns_server =.*$/dns_server = $INPUT_ESC/" "$CONFIG_FILE"
+
 read -r -p "Upstream protocol (udp/tcp/tls/https/quic) [udp]: " INPUT; INPUT=${INPUT:-udp}
-sed -i "s/^dns_protocol =.*$/dns_protocol = $INPUT/" "$CONFIG_FILE"
+INPUT_ESC="$(escape_sed "$INPUT")"
+sed -i "s/^dns_protocol =.*$/dns_protocol = $INPUT_ESC/" "$CONFIG_FILE"
+
 read -r -p "Enable blocklists? (true/false) [false]: " INPUT; INPUT=${INPUT:-false}
-sed -i "s/^enabled =.*$/enabled = $INPUT/" "$CONFIG_FILE"
+INPUT_ESC="$(escape_sed "$INPUT")"
+sed -i "s/^enabled =.*$/enabled = $INPUT_ESC/" "$CONFIG_FILE"
 if [ "$INPUT" = "true" ]; then
   read -r -p "Blocklist URLs (comma-separated) []: " INPUT2
-  sed -i "s/^urls =.*$/urls = $INPUT2/" "$CONFIG_FILE"
+  INPUT2_ESC="$(escape_sed "$INPUT2")"
+  sed -i "s/^urls =.*$/urls = $INPUT2_ESC/" "$CONFIG_FILE"
   read -r -p "Block action (ZEROIP/NXDOMAIN/REFUSED) [NXDOMAIN]: " INPUT3; INPUT3=${INPUT3:-NXDOMAIN}
-  sed -i "s/^action =.*$/action = $INPUT3/" "$CONFIG_FILE"
+  INPUT3_ESC="$(escape_sed "$INPUT3")"
+  sed -i "s/^action =.*$/action = $INPUT3_ESC/" "$CONFIG_FILE"
 fi
 
 # Skip interactive DHCP, logging and other prompts; defaults from template will be used.

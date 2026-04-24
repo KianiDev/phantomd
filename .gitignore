@@ -8,3 +8,5 @@ __pycache__/
 config/certs/
 .vscode/
 .pytest_cache
+.idea/
+.vs/

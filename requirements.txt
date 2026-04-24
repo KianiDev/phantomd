@@ -21,7 +21,7 @@ scapy>=2.6.1
 
 # Development / testing packages have been intentionally removed from this file.
 # If you are developing or running tests install them separately, for example:
-#   pip install pytest hypothesis boofuzz
+#   pip install pytest hypothesis boofuzz pytest pytest-asyncio
 # Notes:
 # - Some packages (cryptography, aioquic) may require system build deps (libssl-dev, rustc, cargo)
 #   to build from source; prefer installing binary wheels on supported platforms or

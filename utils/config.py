@@ -5,30 +5,68 @@ import configparser
 def load_config(path='config/phantomd.conf'):
     config = configparser.ConfigParser()
     if not os.path.exists(path):
-        # return defaults if config missing
+        # Return a full set of defaults when no config file is present.
+        # This ensures all expected keys are available with safe values.
         return {
             'verbose': False,
             'listen_ip': '0.0.0.0',
             'listen_port': 53,
+            'listen_loopback_only': False,
             'upstream_dns': '1.1.1.1',
             'protocol': 'udp',
             'dns_resolver_server': '1.1.1.1:53',
             'disable_ipv6': False,
-            'blocklists': {'enabled': False, 'urls': [], 'interval_seconds': 86400, 'action': 'NXDOMAIN'},
-            'dhcp': {'enabled': False},
+            'blocklists': {
+                'enabled': False,
+                'urls': [],
+                'interval_seconds': 86400,
+                'action': 'NXDOMAIN',
+                'local_blocklist_dir': 'blocklists',
+                'reload_on_change': True
+            },
+            'dhcp': {
+                'enabled': False,
+                'subnet': '192.168.1.0',
+                'netmask': '255.255.255.0',
+                'start_ip': '192.168.1.100',
+                'end_ip': '192.168.1.200',
+                'lease_ttl': 86400,
+                'static_leases': {},
+                'lease_db_path': '/var/lib/phantomd/dhcp_leases.json',
+                'rate_limit_rps': 5.0,
+                'rate_limit_burst': 20
+            },
             'dns_cache_ttl': 300,
             'dns_cache_max_size': 1024,
             'dns_logging_enabled': False,
             'dns_log_retention_days': 7,
             'dns_log_dir': '/var/log/phantomd',
             'dns_log_prefix': 'dns-log',
-            'dns_pinned_certs': None,
+            'dns_pinned_certs': {},
             'dnssec_enabled': False,
-            'trust_anchors_file': None,
+            'trust_anchors_file': '',
             'metrics_enabled': False,
+            'metrics_port': 8000,
             'uvloop_enable': False,
+            'require_privileged_bind': False,
+            'log_dir_owner': 'root:root',
+            'lease_db_owner': 'root:root',
+            'lease_sqlite_enabled': True,
+            'lease_sqlite_path': '/var/lib/phantomd/dhcp_leases.sqlite',
+            'dhcp_arp_probe_enable': True,
+            'dhcp_arp_probe_timeout': 1,
+            'dhcp_privilege_drop_user': 'nobody',
+            'dhcp_privilege_drop_group': '',
+            'dhcp_chroot_dir': '',
+            'dhcp_test_bind_port': 67,
+            'upstream_retries': 2,
+            'upstream_initial_backoff': 0.1,
+            'upstream_udp_timeout': 2.0,
+            'upstream_tcp_timeout': 5.0,
+            'upstream_doh_timeout': 5.0,
         }
     config.read(path)
+
     # read blocklists section
     block_enabled = config.getboolean('blocklists', 'enabled', fallback=False)
     block_urls = config.get('blocklists', 'urls', fallback='')
@@ -39,8 +77,10 @@ def load_config(path='config/phantomd.conf'):
     # local blocklist dir & reload behavior
     block_local_dir = config.get('blocklists', 'local_blocklist_dir', fallback='blocklists')
     block_reload_on_change = config.getboolean('blocklists', 'reload_on_change', fallback=True)
+
     # read disable ipv6 option under upstream
     disable_ipv6 = config.getboolean('upstream', 'disable_ipv6', fallback=False)
+
     # DNS cache settings
     dns_cache_ttl = config.getint('upstream', 'dns_cache_ttl', fallback=300)
     dns_cache_max_size = config.getint('upstream', 'dns_cache_max_size', fallback=1024)
@@ -84,7 +124,7 @@ def load_config(path='config/phantomd.conf'):
     dhcp_privilege_drop_user = config.get('dhcp', 'privilege_drop_user', fallback='nobody')
     dhcp_privilege_drop_group = config.get('dhcp', 'privilege_drop_group', fallback='')
     dhcp_chroot_dir = config.get('dhcp', 'chroot_dir', fallback='')
-    dhcp_test_bind_port = config.getint('dhcp', 'test_bind_port', fallback=67)
+    dhcp_test_bind_port = config.getint('dhcp', 'bind_port', fallback=67)
     lease_sqlite_enabled = config.getboolean('dhcp', 'lease_sqlite_enabled', fallback=True)
     lease_sqlite_path = config.get('dhcp', 'lease_sqlite_path', fallback='/var/lib/phantomd/dhcp_leases.sqlite')
     # parse static leases in format mac=ip,mac=ip
@@ -139,8 +179,26 @@ def load_config(path='config/phantomd.conf'):
         'protocol': config.get('upstream', 'dns_protocol', fallback='udp'),
         'dns_resolver_server': dns_resolver_server,
         'disable_ipv6': disable_ipv6,
-        'blocklists': {'enabled': block_enabled, 'urls': urls_list, 'interval_seconds': block_interval, 'action': block_action, 'local_blocklist_dir': block_local_dir, 'reload_on_change': block_reload_on_change},
-        'dhcp': {'enabled': dhcp_enabled, 'subnet': dhcp_subnet, 'netmask': dhcp_netmask, 'start_ip': dhcp_start, 'end_ip': dhcp_end, 'lease_ttl': dhcp_lease_ttl, 'static_leases': static_leases, 'lease_db_path': dhcp_lease_db, 'rate_limit_rps': dhcp_rate_limit_rps, 'rate_limit_burst': dhcp_rate_limit_burst},
+        'blocklists': {
+            'enabled': block_enabled,
+            'urls': urls_list,
+            'interval_seconds': block_interval,
+            'action': block_action,
+            'local_blocklist_dir': block_local_dir,
+            'reload_on_change': block_reload_on_change
+        },
+        'dhcp': {
+            'enabled': dhcp_enabled,
+            'subnet': dhcp_subnet,
+            'netmask': dhcp_netmask,
+            'start_ip': dhcp_start,
+            'end_ip': dhcp_end,
+            'lease_ttl': dhcp_lease_ttl,
+            'static_leases': static_leases,
+            'lease_db_path': dhcp_lease_db,
+            'rate_limit_rps': dhcp_rate_limit_rps,
+            'rate_limit_burst': dhcp_rate_limit_burst
+        },
         'dns_cache_ttl': dns_cache_ttl,
         'dns_cache_max_size': dns_cache_max_size,
         'dns_logging_enabled': dns_logging_enabled,

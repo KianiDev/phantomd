@@ -98,8 +98,13 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
 
 
 async def periodic_fetch(urls, interval_seconds=86400, destination_dir='blocklists'):
+    """Periodically fetch blocklists at the given interval (seconds)."""
+    logging.info("Starting periodic blocklist refresh every %s seconds", interval_seconds)
     while True:
-        await fetch_blocklists(urls, destination_dir)
+        try:
+            await fetch_blocklists(urls, destination_dir)
+        except Exception as e:
+            logging.warning("Periodic fetch encountered an error: %s", e)
         await asyncio.sleep(interval_seconds)
 
 

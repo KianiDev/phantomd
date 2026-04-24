@@ -1011,7 +1011,8 @@ class DHCPServer:
         while True:
             try:
                 await asyncio.sleep(60)
-                self._cleanup_expired()
+                async with self._lock:               # <-- FIX: protect shared state
+                    self._cleanup_expired()
                 cut = time.time() - 300
                 for m, (ip, ts) in list(self._offered.items()):
                     if ts < cut:
