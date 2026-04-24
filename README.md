@@ -14,7 +14,9 @@ A lightweight, modular DNS proxy with filtering and secure upstream support.
 - Minimal dependencies — runs on low-resource servers  *(tested on an Intel Core Duo with 3 GB RAM)*
 
 ## 💡 Installation
-- Run the installer file of the version you want to install. The installer is interactive and will guide you through the installation process.
+- Run the installer file. The installer is interactive and will guide you through the installation process.
+- For installing specific versions, edit the installer file and change the version number.
+
 
 ## 🔒 Security Notes
 - By default, phantomd only forwards DNS traffic.
