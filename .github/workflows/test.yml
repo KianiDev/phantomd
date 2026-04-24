@@ -1,3 +1,4 @@
+# .github/workflows/tests.yml
 name: Run Tests
 
 on:
@@ -39,7 +40,4 @@ jobs:
 
     - name: Run tests
       run: |
-        pytest core/resolver.py -v
-        # Add more test files as they are written:
-        # pytest core/phantomd_dhcp.py -v
-        # pytest utils/config.py -v
+        pytest tests/ -v
