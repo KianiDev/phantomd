@@ -2,7 +2,7 @@
 set -eu
 
 # Fetches repository tarball, sets up virtualenv, installs deps, creates systemd service,
-# and writes config/phantomd.conf interactively.
+# and writes config/phantomd.conf interactively
 
 VERSION="1.1.0"
 REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
