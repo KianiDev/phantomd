@@ -34,7 +34,7 @@ A lightweight, modular DNS proxy with filtering and secure upstream support.
 
 ## 🗺️ Roadmap
 
-- [*] Full DoQ support
+- [x] Full DoQ support
 - [ ] Config reloading without restart
 - [ ] Optional web dashboard
 - [ ] Preventing DNS leaking at network level
