@@ -1,4 +1,13 @@
 # tests/conftest.py
+import sys
+import os
+
+# Add the project root directory to Python's path so that `core` and `utils`
+# can be imported when running tests from any directory.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import pytest
 import asyncio
 from core.resolver import DNSResolver
