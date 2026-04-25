@@ -3,25 +3,35 @@ import sys
 import logging
 import requests
 import asyncio
+from typing import List, Optional, Tuple
 
 from urllib.parse import urlparse
 
 
-def _write_text(dest_path, text):
+def _write_text(dest_path: str, text: str) -> None:
+    """Write text content to a file."""
     with open(dest_path, 'w', encoding='utf-8') as f:
         f.write(text)
 
 
-def fetch_blocklists_sync(urls, destination_dir='blocklists'):
-    """Fetch blocklists from a list (or comma-separated string) of URLs or local paths synchronously.
+def fetch_blocklists_sync(
+    urls: List[str],
+    destination_dir: str = 'blocklists'
+) -> List[Tuple[str, bool]]:
+    """Fetch blocklists from a list of URLs or local paths synchronously.
 
-    Returns list of (source, True/False) for success of each.
+    Args:
+        urls: A list of URLs (http/https) or local file paths.
+        destination_dir: Directory where fetched files are stored.
+
+    Returns:
+        A list of (source, success) tuples indicating the fetch result for each source.
     """
     if isinstance(urls, str):
         # allow comma-separated list
         urls = [u.strip() for u in urls.split(',') if u.strip()]
     os.makedirs(destination_dir, exist_ok=True)
-    results = []
+    results: List[Tuple[str, bool]] = []
     for idx, raw in enumerate(urls):
         raw = raw.strip()
         if not raw:
@@ -52,7 +62,10 @@ def fetch_blocklists_sync(urls, destination_dir='blocklists'):
     return results
 
 
-async def fetch_blocklists(urls, destination_dir='blocklists'):
+async def fetch_blocklists(
+    urls: List[str],
+    destination_dir: str = 'blocklists'
+) -> List[Tuple[str, bool]]:
     """Async fetch using aiohttp. Returns list of (source, True/False)."""
     try:
         import aiohttp
@@ -61,7 +74,7 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
     if isinstance(urls, str):
         urls = [u.strip() for u in urls.split(',') if u.strip()]
     os.makedirs(destination_dir, exist_ok=True)
-    results = []
+    results: List[Tuple[str, bool]] = []
     async with aiohttp.ClientSession() as session:
         for idx, raw in enumerate(urls):
             raw = raw.strip()
@@ -97,7 +110,11 @@ async def fetch_blocklists(urls, destination_dir='blocklists'):
     return results
 
 
-async def periodic_fetch(urls, interval_seconds=86400, destination_dir='blocklists'):
+async def periodic_fetch(
+    urls: List[str],
+    interval_seconds: int = 86400,
+    destination_dir: str = 'blocklists'
+) -> None:
     """Periodically fetch blocklists at the given interval (seconds)."""
     logging.info("Starting periodic blocklist refresh every %s seconds", interval_seconds)
     while True:
@@ -108,7 +125,12 @@ async def periodic_fetch(urls, interval_seconds=86400, destination_dir='blocklis
         await asyncio.sleep(interval_seconds)
 
 
-def start_periodic_fetch_in_background(urls, interval_seconds=86400, destination_dir='blocklists'):
+def start_periodic_fetch_in_background(
+    urls: List[str],
+    interval_seconds: int = 86400,
+    destination_dir: str = 'blocklists'
+) -> None:
+    """Schedule blocklist fetching as a background task on the current event loop."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -120,5 +142,5 @@ def start_periodic_fetch_in_background(urls, interval_seconds=86400, destination
 
 if __name__ == '__main__':
     # quick test
-    urls = sys.argv[1:] if len(sys.argv) > 1 else []
+    urls: List[str] = sys.argv[1:] if len(sys.argv) > 1 else []
     asyncio.run(fetch_blocklists(urls))

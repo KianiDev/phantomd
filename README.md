@@ -20,16 +20,14 @@ A lightweight, modular DNS proxy with filtering and secure upstream support.
 - Run the installer file. The installer is interactive and will guide you through the installation process.
 - For installing specific versions, edit the installer file and change the version number.
 
-
 ## 🔒 Security Notes
 
-- By default, phantomd only forwards DNS traffic. 
+- By default, phantomd only forwards DNS traffic.
 - You can integrate it with `hostapd` by enabling the DHCP server in the config,  allowing Phantomd to act as a network-level DNS filter. (recommended)
-
 
 ## 🛠️ Development
 
-- Python 3.10+ recommended. 
+- Python 3.10+ recommended.
 - Built with `asyncio` for concurrency.
 
 ## 🗺️ Roadmap
