@@ -1070,64 +1070,136 @@ class DNSResolver:
             await writer.wait_closed()
 
     async def _forward_quic(self, data: bytes):
+        """Forward DNS query over QUIC (DoQ).
+
+        Uses the aioquic public create_stream API when available (>=0.9.24), falling back to
+        the older private _quic approach for compatibility. Enhanced with robust error handling
+        and certificate pinning.
+        """
         host, port = self._split_hostport(self.upstream_dns, default_port=784)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
-        configuration = QuicConfiguration(is_client=True, alpn_protocols=["doq"], verify_mode=ssl.CERT_REQUIRED)
+
+        configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=["doq"],
+            verify_mode=ssl.CERT_REQUIRED
+        )
+        # For older aioquic versions we still need the import; keep it local
         from aioquic.asyncio.client import connect
+
         response_data = bytearray()
         response_event = asyncio.Event()
+        stream_complete = False
 
         class DoQProto:
             def quic_event_received(self, event):
+                nonlocal stream_complete
                 from aioquic.quic.events import StreamDataReceived
                 if isinstance(event, StreamDataReceived):
                     response_data.extend(event.data)
                     if event.end_stream:
+                        stream_complete = True
                         response_event.set()
 
         proto = DoQProto()
-        async with connect(resolved, int(port), configuration=configuration, create_protocol=lambda *a, **k: proto) as client:
-            # best-effort certificate pin check for aioquic client
-            try:
-                if self.pinned_certs:
-                    der = None
-                    try:
-                        get_chain = getattr(client, 'get_peer_cert_chain', None)
-                        if callable(get_chain):
-                            chain = get_chain()
-                            if chain and isinstance(chain, (list, tuple)):
-                                first = chain[0]
-                                if isinstance(first, bytes):
-                                    der = first
-                                elif hasattr(first, 'public_bytes'):
-                                    try:
-                                        from cryptography.hazmat.primitives.serialization import Encoding
-                                        der = first.public_bytes(Encoding.DER)
-                                    except Exception:
-                                        der = None
-                    except Exception:
-                        der = None
-                    if der:
-                        await self._check_cert_pins(host, self._DERPeerWrapper(der))
-                    else:
-                        self.logger.debug("DoQ: peer cert chain not available for pin-check; skipping")
-            except Exception:
-                self.logger.exception("DoQ certificate pin check failed")
 
-            quic = client._quic
-            stream_id = quic.get_next_available_stream_id()
-            quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+        # Helper to extract DER cert from aioquic client (try all known ways)
+        def _get_quic_cert_der(client):
             try:
-                await client.wait_connected()
+                # Newer aioquic (>=0.9.24) has get_peer_certificate() returning Certificate
+                if hasattr(client, 'get_peer_certificate'):
+                    cert = client.get_peer_certificate()
+                    if cert is not None:
+                        if hasattr(cert, 'public_bytes'):
+                            from cryptography.hazmat.primitives.serialization import Encoding
+                            return cert.public_bytes(Encoding.DER)
+                        # some implementations return raw bytes
+                        if isinstance(cert, bytes):
+                            return cert
+                # Fallback: check client._quic.tls._peer_certificate (private, but widely used)
+                if hasattr(client, '_quic'):
+                    quic = client._quic
+                    if hasattr(quic, 'tls') and hasattr(quic.tls, '_peer_certificate'):
+                        cert = quic.tls._peer_certificate
+                        if cert is not None:
+                            if hasattr(cert, 'public_bytes'):
+                                from cryptography.hazmat.primitives.serialization import Encoding
+                                return cert.public_bytes(Encoding.DER)
+                            if isinstance(cert, bytes):
+                                return cert
+                # Try get_peer_cert_chain (returns list of certificates)
+                get_chain = getattr(client, 'get_peer_cert_chain', None)
+                if callable(get_chain):
+                    chain = get_chain()
+                    if chain and isinstance(chain, (list, tuple)):
+                        first = chain[0]
+                        if isinstance(first, bytes):
+                            return first
+                        if hasattr(first, 'public_bytes'):
+                            from cryptography.hazmat.primitives.serialization import Encoding
+                            return first.public_bytes(Encoding.DER)
             except Exception:
                 pass
-            await asyncio.wait_for(response_event.wait(), timeout=self.doh_timeout)
+            return None
+
+        async with connect(resolved, int(port), configuration=configuration, create_protocol=lambda *a, **k: proto) as client:
+            # --- certificate pinning (improved) ---
+            if self.pinned_certs:
+                der = _get_quic_cert_der(client)
+                if der:
+                    try:
+                        await self._check_cert_pins(host, self._DERPeerWrapper(der))
+                    except Exception:
+                        self.logger.exception("DoQ certificate pin check failed")
+                        raise
+                else:
+                    self.logger.warning("DoQ: unable to obtain peer certificate for pin-check; proceeding without")
+
+            # --- Open a stream and send query ---
+            # Try public create_stream first (aioquic >= 0.9.24)
+            try:
+                if hasattr(client, 'create_stream'):
+                    # create_stream returns (stream_id, reader, writer)
+                    stream_id, quic_reader, quic_writer = await client.create_stream()
+                    # Send DNS length prefix + data
+                    quic_writer.write(len(data).to_bytes(2, "big") + data)
+                    await quic_writer.drain()
+                    # wait for connection
+                    try:
+                        await asyncio.wait_for(client.wait_connected(), timeout=5.0)
+                    except Exception:
+                        self.logger.debug("DoQ wait_connected failed, continuing")
+                else:
+                    # fallback to private API (older aioquic)
+                    quic = client._quic
+                    stream_id = quic.get_next_available_stream_id()
+                    quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+                    try:
+                        await client.wait_connected()
+                    except Exception:
+                        pass
+            except Exception as e:
+                raise Exception(f"DoQ stream creation failed: {e}")
+
+            # --- Wait for response with timeout ---
+            try:
+                await asyncio.wait_for(response_event.wait(), timeout=self.doh_timeout)
+            except asyncio.TimeoutError:
+                raise Exception("DoQ response timeout")
+
+            if not stream_complete:
+                raise Exception("DoQ response stream did not complete")
+
             resp = bytes(response_data)
             if len(resp) < 2:
-                raise Exception("Invalid DoQ response")
+                raise Exception("Invalid DoQ response (too short)")
+
+            # Parse length prefix
             resp_len = int.from_bytes(resp[:2], "big")
+            if resp_len + 2 > len(resp):
+                raise Exception(f"DoQ response truncated: expected {resp_len} bytes, got {len(resp)-2}")
             return resp[2:2+resp_len]
 
     # --- name resolution helpers --------------------------------------------------

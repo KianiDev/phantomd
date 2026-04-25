@@ -12,7 +12,7 @@ aiohttp>=3.8.4
 uvloop>=0.17.0
 
 # QUIC / DoQ  
-aioquic>=0.10.0
+aioquic>=0.9.24
 h3>=0.13.0
 
 # Utilities
