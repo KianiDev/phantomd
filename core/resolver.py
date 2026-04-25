@@ -123,6 +123,7 @@ class DNSResolver:
       - Integrated rate limiter (per client IP)
       - Multi-upstream with automatic failover (configurable upstream list)
       - Optimistic caching (serve-stale per RFC 8767)
+      - DNS rebinding protection (strip or block private IPs)
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -154,7 +155,9 @@ class DNSResolver:
                   upstreams: Optional[List[Dict[str, Any]]] = None,
                   optimistic_cache_enabled: bool = False,
                   optimistic_stale_max_age: int = 86400,
-                  optimistic_stale_response_ttl: int = 30) -> None:
+                  optimistic_stale_response_ttl: int = 30,
+                  rebind_protection_enabled: bool = False,
+                  rebind_action: str = 'strip') -> None:
         # --- single upstream fallback ---
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
@@ -262,10 +265,12 @@ class DNSResolver:
         self._stale_refresh_pending: Set[str] = set()
         self._stale_refresh_lock: asyncio.Lock = asyncio.Lock()
 
+        # --- DNS rebinding protection ---
+        self.rebind_protection_enabled: bool = rebind_protection_enabled
+        self.rebind_action: str = rebind_action
+
     # ---------- blocklist helpers ----------
     def set_blocklist(self, domains: Iterable[str]) -> None:
-        """Replace blocklist. domains is an iterable of domain strings.
-           Use ".example.com" to block suffix (subdomains), or "bad.example" to block exact name."""
         self._blocklist_exact.clear()
         self._blocklist_suffix.clear()
         for d in domains:
@@ -278,11 +283,9 @@ class DNSResolver:
                 self._blocklist_exact.add(d)
 
     def set_hosts_map(self, hosts_map: Dict[str, Tuple[str, ...]]) -> None:
-        """Provide an exact-domain -> tuple(...) mapping used to synthesize host responses."""
         self._hosts_map = {k.lower().rstrip('.'): tuple(v) for k, v in (hosts_map or {}).items()}
 
     def get_host_for(self, qname: str) -> Optional[Tuple[str, ...]]:
-        """Return tuple associated with exact qname or None."""
         if not qname:
             return None
         return self._hosts_map.get(qname.lower().rstrip('.'))
@@ -296,7 +299,6 @@ class DNSResolver:
 
     @staticmethod
     def load_blocklists_from_dir(directory: str) -> Tuple[Set[str], Set[str], Dict[str, Tuple[str, ...]]]:
-        """Load blocklist files from a directory. Returns (exact_set, suffix_set, hosts_map)."""
         exact_set: Set[str] = set()
         suffix_set: Set[str] = set()
         hosts_map: Dict[str, Tuple[str, ...]] = {}
@@ -314,14 +316,12 @@ class DNSResolver:
                     parts = line.split()
                     if len(parts) == 0:
                         continue
-                    # hosts format: IP domain
                     if len(parts) >= 2 and (parts[0].count('.') == 3 or ':' in parts[0]):
                         ip = parts[0]
                         domain = parts[1].lower().rstrip('.')
                         hosts_map[domain] = (ip,)
                         exact_set.add(domain)
                         continue
-                    # simple domain entries
                     domain = parts[0].lower().rstrip('.')
                     if domain.startswith('.'):
                         suffix_set.add(domain.lstrip('.'))
@@ -335,7 +335,6 @@ class DNSResolver:
         q = qname.lower().rstrip('.')
         if q in self._blocklist_exact:
             return True
-        # suffix match: check progressively shorter suffixes
         for suf in self._blocklist_suffix:
             if q == suf or q.endswith("." + suf):
                 return True
@@ -343,7 +342,6 @@ class DNSResolver:
 
     # ---------- wire-cache helpers (extended for optimistic caching) ----------
     async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, float, bytes, float]]:
-        """Return the full cache entry or None."""
         try:
             async with self._lock:
                 if self._cache_is_sync:
@@ -356,7 +354,6 @@ class DNSResolver:
 
     async def _wire_cache_set(self, key: Tuple[str, int, str], response_bytes: bytes,
                               ttl_seconds: int, query_data: bytes) -> None:
-        """Store wire response with per-entry TTL and optional stale support."""
         try:
             expiry = time.time() + max(0, int(ttl_seconds or 0))
             stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
@@ -371,47 +368,33 @@ class DNSResolver:
             self.logger.debug("wire cache set error %s: %s", key, e)
 
     async def _wire_cache_get_valid(self, key: Tuple[str, int, str]) -> Optional[bytes]:
-        """Return fresh or stale response bytes, or None. Triggers background refresh for stale."""
         try:
             async with self._lock:
                 entry = await self._wire_cache_get(key) if not self._cache_is_sync else self._wire_cache.get(key)
                 if entry is None:
                     return None
-
-                # Handle older format (just bytes) for backward compatibility
                 if isinstance(entry, bytes):
                     return entry
-
-                # Expected format: (response_bytes, expiry, query_data, stale_until)
                 if isinstance(entry, tuple) and len(entry) == 4:
                     resp_bytes, expiry, query_data, stale_until = entry
                     now = time.time()
                     if now < expiry:
-                        # still fresh
                         return resp_bytes
-                    # expired – check if stale serving is enabled and allowed
                     if self.optimistic_cache_enabled and now < stale_until:
-                        # serve stale and trigger background refresh
                         self.logger.debug("serving stale response for %s (age=%.1fs)", key, now - expiry)
-                        # Modify TTL in the response to short value
                         stale_resp = self._set_response_ttl(resp_bytes, self.stale_response_ttl)
-                        # Fire off background refresh if not already pending
                         await self._maybe_refresh_stale(key, query_data)
                         return stale_resp
-                    # truly expired – delete
                     if self._cache_is_sync:
                         del self._wire_cache[key]  # type: ignore[attr-defined]
                     else:
                         await self._wire_cache.delete(key)  # type: ignore[attr-defined]
                     return None
-
-                # If it's an older tuple format without query_data/stale_until, treat as expired
                 return None
         except Exception:
             return None
 
     async def _maybe_refresh_stale(self, key: Tuple[str, int, str], query_data: bytes) -> None:
-        """Schedule a background refresh if not already in progress."""
         async with self._stale_refresh_lock:
             if key in self._stale_refresh_pending:
                 return
@@ -419,7 +402,6 @@ class DNSResolver:
         asyncio.create_task(self._background_refresh(key, query_data))
 
     async def _background_refresh(self, key: Tuple[str, int, str], query_data: bytes) -> None:
-        """Fetch a fresh response from upstream and update the cache."""
         try:
             upstream_list = self.upstreams if self.upstreams else [
                 {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
@@ -435,7 +417,6 @@ class DNSResolver:
                                 await self._dnssec_validate(qname, resp)
                             except Exception as e:
                                 self.logger.warning("DNSSEC validation failed for stale refresh %s: %s", key, e)
-                                # continue to next upstream
                                 continue
                     ttl = self._extract_min_ttl(resp)
                     if ttl <= 0:
@@ -452,46 +433,34 @@ class DNSResolver:
                 self._stale_refresh_pending.discard(key)
 
     def _set_response_ttl(self, response_bytes: bytes, ttl: int) -> bytes:
-        """Return a copy of the response where every resource record TTL is set to `ttl`."""
-        if not _HAS_DNSPY:
-            return response_bytes
-        try:
-            old_msg = dns.message.from_wire(response_bytes)
-            new_msg = dns.message.Message()
-            new_msg.id = old_msg.id
-            new_msg.flags = old_msg.flags
+        """Set all TTLs in the DNS answer/authority/additional sections to the given value."""
+        if _HAS_DNSPY:
+            try:
+                msg = dns.message.from_wire(response_bytes)
+                new_msg = dns.message.Message()
+                new_msg.id = msg.id
+                new_msg.flags = msg.flags
+                for q in msg.question:
+                    new_msg.question.append(q)
 
-            # Copy question section unchanged
-            for q in old_msg.question:
-                new_msg.question.append(q)
+                def _replace_ttl(rrset_list):
+                    new_list = []
+                    for rrset in rrset_list:
+                        new_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                        new_rr.ttl = ttl
+                        for rd in rrset:
+                            rd.ttl = ttl
+                            new_rr.add(rd)
+                        new_list.append(new_rr)
+                    return new_list
 
-            # Helper to rebuild a list of rrsets with a different TTL
-            def _rebuild_section(rrsets):
-                new_list = []
-                for rrset in rrsets:
-                    # Create a new, empty rrset of the same type, class, and name
-                    new_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
-                    new_rrset.ttl = ttl
-                    for rd in rrset:
-                        # Get the original rdata as wire bytes
-                        rd_wire = rd.to_wire()
-                        # Re‑create a fresh rdata object so no cached wire remains
-                        new_rd = dns.rdata.from_wire(
-                            rrset.rdclass, rrset.rdtype, rd_wire, 0, len(rd_wire)
-                        )
-                        new_rrset.add(new_rd)
-                    new_list.append(new_rrset)
-                return new_list
-
-            new_msg.answer = _rebuild_section(old_msg.answer)
-            new_msg.authority = _rebuild_section(old_msg.authority)
-            new_msg.additional = _rebuild_section(old_msg.additional)
-
-            return new_msg.to_wire()
-        except Exception as e:
-            # If anything fails, log and fall back to the original response
-            self.logger.debug("_set_response_ttl failed: %s", e)
-            return response_bytes
+                new_msg.answer = _replace_ttl(msg.answer)
+                new_msg.authority = _replace_ttl(msg.authority)
+                new_msg.additional = _replace_ttl(msg.additional)
+                return new_msg.to_wire()
+            except Exception as e:
+                self.logger.debug("_set_response_ttl failed: %s", e)
+        return response_bytes
 
     # ---------- parsing helpers ----------
     @staticmethod
@@ -845,7 +814,6 @@ class DNSResolver:
 
     # --- New: try an upstream and return response or raise ---
     async def _try_upstream(self, upstream: Dict[str, Any], data: bytes) -> bytes:
-        """Forward a query to a single upstream and return the response."""
         proto = upstream.get('protocol', 'udp')
         if proto == 'udp':
             return await self._with_retries(
@@ -899,6 +867,8 @@ class DNSResolver:
         cached = await self._wire_cache_get_valid(key)
         if cached:
             self.logger.debug("wire-cache hit %s", key)
+            if self.rebind_protection_enabled:
+                cached = self._apply_rebind_protection(cached)
             return cached
 
         # --- prepare upstream list ---
@@ -910,23 +880,24 @@ class DNSResolver:
         for upstream in upstream_list:
             try:
                 resp = await self._try_upstream(upstream, data)
-                # metrics (use protocol of the successful upstream)
                 if self.metrics_enabled and self._metrics:
                     try:
                         self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
                     except Exception:
                         pass
-                # DNSSEC validate if enabled
                 if self.dnssec_enabled and qname:
                     try:
                         await self._dnssec_validate(qname, resp)
                     except Exception as e:
                         self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
                         raise
+                # Apply rebinding protection after successful response
+                if self.rebind_protection_enabled:
+                    resp = self._apply_rebind_protection(resp)
                 ttl = self._extract_min_ttl(resp)
                 if ttl <= 0:
                     ttl = 30
-                await self._wire_cache_set(key, resp, ttl, data)   # pass query_data for stale support
+                await self._wire_cache_set(key, resp, ttl, data)
                 return resp
             except Exception as e:
                 last_exc = e
@@ -1030,7 +1001,6 @@ class DNSResolver:
 
     async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
-            # fallback: build URL from self.upstream_dns
             url = self.upstream_dns if (self.upstream_dns.startswith("http://") or self.upstream_dns.startswith("https://")) \
                   else (f"https://{self.upstream_dns}" if "/" in self.upstream_dns else f"https://{self.upstream_dns}/dns-query")
             parsed = urlparse(url)
@@ -1510,6 +1480,59 @@ class DNSResolver:
         except Exception:
             return self._make_nxdomain_response(request_data)
 
+    # --- NEW: DNS rebinding protection ---
+    @staticmethod
+    def _is_private_ip(ip_str: str) -> bool:
+        """Return True if *ip_str* is a private or special-use IPv4/IPv6 address."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if isinstance(ip, ipaddress.IPv4Address):
+            return (ip.is_private or
+                    ip.is_loopback or
+                    ip.is_link_local or
+                    ip.is_reserved or
+                    ip.is_multicast or
+                    ip.is_unspecified)
+        else:  # IPv6
+            return (ip.is_private or
+                    ip.is_loopback or
+                    ip.is_link_local or
+                    ip.is_reserved or
+                    ip.is_multicast or
+                    ip.is_unspecified)
+
+    def _apply_rebind_protection(self, response_bytes: bytes) -> bytes:
+        """Strip or block private IPs from a DNS response."""
+        if not self.rebind_protection_enabled or not _HAS_DNSPY:
+            return response_bytes
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            filtered_answer = []
+            for rrset in msg.answer:
+                if rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                    new_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                    new_rrset.ttl = rrset.ttl
+                    has_public = False
+                    for rd in rrset:
+                        ip_str = rd.to_text().strip()
+                        if not self._is_private_ip(ip_str):
+                            new_rrset.add(rd)
+                            has_public = True
+                    if has_public:
+                        filtered_answer.append(new_rrset)
+                else:
+                    filtered_answer.append(rrset)
+            msg.answer = filtered_answer
+
+            if self.rebind_action == 'block' and not filtered_answer:
+                return self._make_nxdomain_response(b'\x00'*12)
+            return msg.to_wire()
+        except Exception as e:
+            self.logger.debug("rebind protection failed: %s", e)
+            return response_bytes
+
     def update_config(self, *,
                       upstream_dns: Optional[str] = None,
                       protocol: Optional[str] = None,
@@ -1533,7 +1556,9 @@ class DNSResolver:
                       upstreams: Optional[List[Dict[str, Any]]] = None,
                       optimistic_cache_enabled: Optional[bool] = None,
                       optimistic_stale_max_age: Optional[int] = None,
-                      optimistic_stale_response_ttl: Optional[int] = None) -> None:
+                      optimistic_stale_response_ttl: Optional[int] = None,
+                      rebind_protection_enabled: Optional[bool] = None,
+                      rebind_action: Optional[str] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -1570,7 +1595,6 @@ class DNSResolver:
             self.metrics_port = int(metrics_port)
         if uvloop_enable is not None:
             pass
-        # Rate limiter updates
         if rate_limit_rps is not None:
             self.rate_limit_rps = rate_limit_rps
         if rate_limit_burst is not None:
@@ -1583,20 +1607,25 @@ class DNSResolver:
                 self.rate_limiter.burst = self.rate_limit_burst
         else:
             self.rate_limiter = None
-        # Upstream list update
         if upstreams is not None:
             self.upstreams = upstreams
-        # Optimistic cache settings
         if optimistic_cache_enabled is not None:
             self.optimistic_cache_enabled = optimistic_cache_enabled
         if optimistic_stale_max_age is not None:
             self.stale_max_age = optimistic_stale_max_age
         if optimistic_stale_response_ttl is not None:
             self.stale_response_ttl = optimistic_stale_response_ttl
+        # DNS rebinding protection updates
+        if rebind_protection_enabled is not None:
+            self.rebind_protection_enabled = rebind_protection_enabled
+        if rebind_action is not None:
+            self.rebind_action = rebind_action.lower()
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
-                         "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s",
+                         "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
+                         "rebind_protection=%s/%s",
                          self.upstream_dns, self.protocol,
                          self.disable_ipv6, self.verbose,
                          self.rate_limit_rps, self.rate_limit_burst,
-                         self.optimistic_cache_enabled)
+                         self.optimistic_cache_enabled,
+                         self.rebind_protection_enabled, self.rebind_action)

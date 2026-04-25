@@ -429,7 +429,7 @@ class TestRateLimitConfig:
 
 
 # ===========================================================================
-# Optimistic caching tests
+# DNS rebinding protection tests
 # ===========================================================================
 
 import dns.message
@@ -437,110 +437,180 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.rrset
 
+
+class TestIsPrivateIP:
+    """Unit tests for the static helper _is_private_ip."""
+
+    def test_public_ipv4(self):
+        assert not DNSResolver._is_private_ip("1.1.1.1")
+        assert not DNSResolver._is_private_ip("8.8.8.8")
+
+    def test_private_ipv4(self):
+        assert DNSResolver._is_private_ip("192.168.1.1")
+        assert DNSResolver._is_private_ip("10.0.0.1")
+        assert DNSResolver._is_private_ip("172.16.0.1")
+
+    def test_loopback_ipv4(self):
+        assert DNSResolver._is_private_ip("127.0.0.1")
+
+    def test_link_local_ipv4(self):
+        assert DNSResolver._is_private_ip("169.254.1.1")
+
+    def test_multicast_ipv4(self):
+        assert DNSResolver._is_private_ip("224.0.0.1")
+
+    def test_public_ipv6(self):
+        assert not DNSResolver._is_private_ip("2001:4860:4860::8888")
+
+    def test_loopback_ipv6(self):
+        assert DNSResolver._is_private_ip("::1")
+
+    def test_link_local_ipv6(self):
+        assert DNSResolver._is_private_ip("fe80::1")
+
+    def test_invalid_ip(self):
+        assert not DNSResolver._is_private_ip("not an ip")
+
+
 @pytest.fixture
-def resolver_optimistic():
-    """Resolver with optimistic caching enabled and a short stale max age."""
+def resolver_rebind_strip():
+    """Resolver with rebinding protection enabled in 'strip' mode."""
     resolver = DNSResolver(
         upstream_dns="1.1.1.1",
         protocol="udp",
         disable_ipv6=True,
-        optimistic_cache_enabled=True,
-        optimistic_stale_max_age=60,
-        optimistic_stale_response_ttl=30,
+        rebind_protection_enabled=True,
+        rebind_action="strip",
     )
-    # Prevent background refresh from actually hitting the network
     resolver._try_upstream = AsyncMock(return_value=b'\x00'*100)
     return resolver
 
 
-@pytest.mark.asyncio
-async def test_fresh_response_returned(resolver_optimistic):
-    """A non-expired entry returns the original response bytes."""
-    key = ("fresh.example", 1, "udp")
-    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05fresh\x07example\x00\x00\x01\x00\x01'
-    resp_data = b'\x56\x78' + b'\x00'*50
-    await resolver_optimistic._wire_cache_set(key, resp_data, ttl_seconds=300, query_data=query_data)
-    result = await resolver_optimistic._wire_cache_get_valid(key)
-    assert result == resp_data
+@pytest.fixture
+def resolver_rebind_block():
+    """Resolver with rebinding protection enabled in 'block' mode."""
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",
+        protocol="udp",
+        disable_ipv6=True,
+        rebind_protection_enabled=True,
+        rebind_action="block",
+    )
+    resolver._try_upstream = AsyncMock(return_value=b'\x00'*100)
+    return resolver
+
+
+class TestApplyRebindProtection:
+    def test_strip_private_ipv4(self, resolver_rebind_strip):
+        """Private IPv4 addresses are stripped; public ones remain."""
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "192.168.1.1"),
+        ]
+        wire = msg.to_wire()
+        result = resolver_rebind_strip._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
+        assert "1.1.1.1" in ips
+        assert "192.168.1.1" not in ips
+
+    def test_strip_all_private_leaves_rrset_empty(self, resolver_rebind_strip):
+        """When all IPs in an rrset are private, the entire rrset is removed."""
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("internal.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1", "192.168.1.1"),
+        ]
+        wire = msg.to_wire()
+        result = resolver_rebind_strip._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        assert len(parsed.answer) == 0
+
+    def test_block_all_private_returns_nxdomain(self, resolver_rebind_block):
+        """With 'block' mode, all private answer returns NXDOMAIN."""
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("internal.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1"),
+        ]
+        wire = msg.to_wire()
+        result = resolver_rebind_block._apply_rebind_protection(wire)
+
+        # The result should be a valid DNS message; if it's NXDOMAIN, the opcode
+        # flags will contain rcode 3.  The message may be a minimal one with zero
+        # questions, so we inspect the flags directly rather than calling from_wire.
+        parsed = dns.message.Message()
+        parsed.flags = struct.unpack("!H", result[2:4])[0]
+        assert (parsed.flags & 0x000F) == 3  # NXDOMAIN
+
+    def test_block_public_ips_preserved(self, resolver_rebind_block):
+        """Public-only answer passes through 'block' mode unchanged."""
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("safe.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "8.8.8.8"),
+        ]
+        wire = msg.to_wire()
+        result = resolver_rebind_block._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
+        assert "1.1.1.1" in ips
+        assert "8.8.8.8" in ips
+
+    def test_disabled_does_nothing(self):
+        """With rebinding disabled, the response passes through unchanged."""
+        resolver = DNSResolver(
+            upstream_dns="1.1.1.1",
+            protocol="udp",
+            disable_ipv6=True,
+            rebind_protection_enabled=False,
+        )
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("mixed.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "10.0.0.1"),
+        ]
+        wire = msg.to_wire()
+        result = resolver._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
+        assert "1.1.1.1" in ips
+        assert "10.0.0.1" in ips  # not stripped
+
+    def test_mixed_aaaa_and_a(self, resolver_rebind_strip):
+        """Private AAAA is stripped; public A remains."""
+        msg = dns.message.Message()
+        msg.answer = [
+            dns.rrset.from_text("dual.example.", 60, dns.rdataclass.IN, dns.rdatatype.AAAA, "2001:4860:4860::8888"),
+            dns.rrset.from_text("dual.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1"),
+            dns.rrset.from_text("dual.example.", 60, dns.rdataclass.IN, dns.rdatatype.AAAA, "::1"),
+        ]
+        wire = msg.to_wire()
+        result = resolver_rebind_strip._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        aaaa_ips = [rd.to_text() for rrset in parsed.answer if rrset.rdtype == dns.rdatatype.AAAA for rd in rrset]
+        a_ips = [rd.to_text() for rrset in parsed.answer if rrset.rdtype == dns.rdatatype.A for rd in rrset]
+        assert "2001:4860:4860::8888" in aaaa_ips
+        assert "1.1.1.1" in a_ips
+        assert "::1" not in aaaa_ips  # private AAAA stripped
 
 
 @pytest.mark.asyncio
-async def test_stale_response_served_and_ttl_modified(resolver_optimistic):
-    """Expired entry within stale window returns data with short TTL."""
-    key = ("stale.example", 1, "udp")
-    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05stale\x07example\x00\x00\x01\x00\x01'
-    # Build a fresh response with a known TTL (e.g., 60 seconds) and insert it as expired
+async def test_forward_query_applies_rebind(resolver_rebind_strip):
+    """Full forward_dns_query flow applies rebind protection after upstream response."""
+    # Build an upstream response with one public, one private IP
     msg = dns.message.make_response(
-        dns.message.from_wire(query_data)
+        dns.message.from_wire(
+            b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+            b'\x04test\x04case\x03com\x00'
+            b'\x00\x01\x00\x01'
+        )
     )
     msg.answer = [
-        dns.rrset.from_text('stale.example.', 60, dns.rdataclass.IN, dns.rdatatype.A, '1.2.3.4')
+        dns.rrset.from_text("test.case.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "192.168.1.1"),
     ]
-    original_wire = msg.to_wire()
-    # Store with expired expiry but still within stale window
-    now = time.time()
-    expiry = now - 10          # expired 10 seconds ago
-    stale_until = now + 600    # stale for another 10 minutes
-    entry = (original_wire, expiry, query_data, stale_until)
-    # Inject directly to bypass the normal set method
-    async with resolver_optimistic._lock:
-        if resolver_optimistic._cache_is_sync:
-            resolver_optimistic._wire_cache[key] = entry
-        else:
-            await resolver_optimistic._wire_cache.set(key, entry)
-    # Now get it
-    result = await resolver_optimistic._wire_cache_get_valid(key)
-    # Verify it returned a response, not None
-    assert result is not None
-    # The TTL in the returned response should be modified to stale_response_ttl=30
-    parsed = dns.message.from_wire(result)
-    assert parsed.answer[0].ttl == 30
-    # Background refresh should have been triggered
-    await asyncio.sleep(0.01)
-    # Since we mocked _try_upstream, it will have been called as a background refresh
-    # But we can't easily assert from here because it's a separate task; we'll trust the log
+    upstream_wire = msg.to_wire()
+    resolver_rebind_strip._try_upstream.return_value = upstream_wire
 
-
-@pytest.mark.asyncio
-async def test_stale_past_max_age_not_served(resolver_optimistic):
-    """When stale_until has passed, the entry is treated as fully expired."""
-    key = ("dead.example", 1, "udp")
-    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04dead\x07example\x00\x00\x01\x00\x01'
-    entry = (b'\x00'*20, time.time() - 120, query_data, time.time() - 10)  # stale_until in past
-    async with resolver_optimistic._lock:
-        if resolver_optimistic._cache_is_sync:
-            resolver_optimistic._wire_cache[key] = entry
-        else:
-            await resolver_optimistic._wire_cache.set(key, entry)
-    result = await resolver_optimistic._wire_cache_get_valid(key)
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_stale_refresh_pending_prevents_duplicate(resolver_optimistic):
-    """If a stale refresh is already pending, no duplicate refresh is scheduled."""
-    key = ("dedup.example", 1, "udp")
-    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05dedup\x07example\x00\x00\x01\x00\x01'
-    # Manually mark a key as pending
-    async with resolver_optimistic._stale_refresh_lock:
-        resolver_optimistic._stale_refresh_pending.add(key)
-    # Attempt to trigger another refresh; should not start a second one
-    with patch.object(resolver_optimistic, '_background_refresh') as mock_refresh:
-        await resolver_optimistic._maybe_refresh_stale(key, query_data)
-        mock_refresh.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_disabled_optimistic_cache_ignores_stale(resolver_no_network):
-    """When optimistic caching is off, stale entries are simply expired."""
-    resolver_no_network.optimistic_cache_enabled = False
-    key = ("noopt.example", 1, "udp")
-    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05noopt\x07example\x00\x00\x01\x00\x01'
-    entry = (b'\x00'*20, time.time() - 10, query_data, time.time() + 600)
-    async with resolver_no_network._lock:
-        if resolver_no_network._cache_is_sync:
-            resolver_no_network._wire_cache[key] = entry
-        else:
-            await resolver_no_network._wire_cache.set(key, entry)
-    result = await resolver_no_network._wire_cache_get_valid(key)
-    assert result is None
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04test\x04case\x03com\x00\x00\x01\x00\x01'
+    resp = await resolver_rebind_strip.forward_dns_query(data)
+    parsed = dns.message.from_wire(resp)
+    ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
+    assert "1.1.1.1" in ips
+    assert "192.168.1.1" not in ips

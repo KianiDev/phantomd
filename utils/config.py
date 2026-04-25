@@ -80,10 +80,12 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'optimistic_cache_enabled': False,
             'optimistic_stale_max_age': 86400,
             'optimistic_stale_response_ttl': 30,
-            # DNS privilege dropping defaults (empty = disabled)
             'dns_privilege_drop_user': '',
             'dns_privilege_drop_group': '',
             'dns_chroot_dir': '',
+            # DNS rebinding protection defaults
+            'dns_rebind_protection': False,
+            'dns_rebind_action': 'strip',
         }
     config.read(path)
 
@@ -175,10 +177,16 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     log_dir_owner: str = config.get('security', 'log_dir_owner', fallback='root:root')
     lease_db_owner: str = config.get('security', 'lease_db_owner', fallback='root:root')
 
-    # DNS-specific privilege dropping (new)
+    # DNS-specific privilege dropping
     dns_privilege_drop_user: str = config.get('security', 'dns_privilege_drop_user', fallback='')
     dns_privilege_drop_group: str = config.get('security', 'dns_privilege_drop_group', fallback='')
     dns_chroot_dir: str = config.get('security', 'dns_chroot_dir', fallback='')
+
+    # DNS rebinding protection (new)
+    dns_rebind_protection: bool = config.getboolean('security', 'dns_rebind_protection', fallback=False)
+    dns_rebind_action: str = config.get('security', 'dns_rebind_action', fallback='strip').lower()
+    if dns_rebind_action not in ('strip', 'block'):
+        dns_rebind_action = 'strip'
 
     # advanced tuning
     upstream_retries: int = config.getint('advanced', 'upstream_retries', fallback=2)
@@ -290,8 +298,9 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'optimistic_cache_enabled': optimistic_cache_enabled,
         'optimistic_stale_max_age': optimistic_stale_max_age,
         'optimistic_stale_response_ttl': optimistic_stale_response_ttl,
-        # DNS privilege dropping
         'dns_privilege_drop_user': dns_privilege_drop_user,
         'dns_privilege_drop_group': dns_privilege_drop_group,
         'dns_chroot_dir': dns_chroot_dir,
+        'dns_rebind_protection': dns_rebind_protection,
+        'dns_rebind_action': dns_rebind_action,
     }

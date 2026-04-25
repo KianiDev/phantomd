@@ -208,6 +208,8 @@ async def reload_resolver(holder: ResolverHolder,
         optimistic_cache_enabled=config.get("optimistic_cache_enabled"),
         optimistic_stale_max_age=config.get("optimistic_stale_max_age"),
         optimistic_stale_response_ttl=config.get("optimistic_stale_response_ttl"),
+        rebind_protection_enabled=config.get("dns_rebind_protection"),
+        rebind_action=config.get("dns_rebind_action"),
     )
 
     if blocklists:
@@ -296,7 +298,9 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      optimistic_stale_response_ttl: int = 30,
                      dns_privilege_drop_user: str = '',
                      dns_privilege_drop_group: str = '',
-                     dns_chroot_dir: str = '') -> None:
+                     dns_chroot_dir: str = '',
+                     dns_rebind_protection: bool = False,
+                     dns_rebind_action: str = 'strip') -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -326,6 +330,8 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         optimistic_cache_enabled=optimistic_cache_enabled,
         optimistic_stale_max_age=optimistic_stale_max_age,
         optimistic_stale_response_ttl=optimistic_stale_response_ttl,
+        rebind_protection_enabled=dns_rebind_protection,
+        rebind_action=dns_rebind_action,
     )
 
     holder = ResolverHolder(resolver)

@@ -84,11 +84,13 @@ def main() -> None:
     optimistic_cache_enabled_val: bool = bool(config.get("optimistic_cache_enabled", False))
     optimistic_stale_max_age_val: int = int(config.get("optimistic_stale_max_age", 86400))
     optimistic_stale_response_ttl_val: int = int(config.get("optimistic_stale_response_ttl", 30))
-
-    # NEW: DNS privilege dropping config
     dns_privilege_drop_user_val: str = str(config.get("dns_privilege_drop_user", ""))
     dns_privilege_drop_group_val: str = str(config.get("dns_privilege_drop_group", ""))
     dns_chroot_dir_val: str = str(config.get("dns_chroot_dir", ""))
+
+    # NEW: DNS rebinding protection config
+    dns_rebind_protection_val: bool = bool(config.get("dns_rebind_protection", False))
+    dns_rebind_action_val: str = str(config.get("dns_rebind_action", "strip"))
 
     # DHCP configuration
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
@@ -237,6 +239,8 @@ def main() -> None:
             dns_privilege_drop_user=dns_privilege_drop_user_val,
             dns_privilege_drop_group=dns_privilege_drop_group_val,
             dns_chroot_dir=dns_chroot_dir_val,
+            dns_rebind_protection=dns_rebind_protection_val,
+            dns_rebind_action=dns_rebind_action_val,
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None
