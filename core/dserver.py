@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Dict, Set, Tuple, Optional, Any
+from typing import Dict, Set, Tuple, Optional, Any, List
 
 from core.resolver import DNSResolver, RateLimiter
 from utils.ListUpdater import fetch_blocklists, periodic_fetch
@@ -216,6 +216,7 @@ async def reload_resolver(holder: ResolverHolder,
         metrics_port=config.get("metrics_port", 8000),
         rate_limit_rps=config.get("rate_limit_rps"),
         rate_limit_burst=config.get("rate_limit_burst"),
+        upstreams=config.get("upstreams"),  # NEW: multi-upstream list
     )
 
     if blocklists:
@@ -265,7 +266,8 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      upstream_tcp_timeout: float = 5.0,
                      upstream_doh_timeout: float = 5.0,
                      rate_limit_rps: float = 0.0,
-                     rate_limit_burst: float = 0.0) -> None:
+                     rate_limit_burst: float = 0.0,
+                     upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -291,6 +293,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         uvloop_enable=uvloop_enable,
         rate_limit_rps=rate_limit_rps,
         rate_limit_burst=rate_limit_burst,
+        upstreams=upstreams,  # NEW: multi-upstream list
     )
 
     # Mutable holder for atomic resolver swaps

@@ -144,7 +144,7 @@ class TestLocalAResponse:
 
 
 # ---------------------------------------------------------------------------
-# NEW: Mocked forwarding tests
+# Mocked forwarding tests (single upstream)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -175,7 +175,9 @@ async def test_forward_udp_called(resolver_mocked_forward):
     data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     # Should call _forward_udp and return its response
-    resolver_mocked_forward._forward_udp.assert_awaited_once_with(data)
+    resolver_mocked_forward._forward_udp.assert_awaited_once_with(
+    data, {'address': '1.2.3.4', 'protocol': 'udp', 'hostname': '1.2.3.4'}
+)
     assert resp == b'\x55\x55'
 
 
@@ -184,7 +186,9 @@ async def test_forward_tcp_called(resolver_mocked_forward):
     resolver_mocked_forward.protocol = "tcp"
     data = b'\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03tcp\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    resolver_mocked_forward._forward_tcp.assert_awaited_once_with(data)
+    resolver_mocked_forward._forward_tcp.assert_awaited_once_with(
+    data, {'address': '1.2.3.4', 'protocol': 'tcp', 'hostname': '1.2.3.4'}
+)
     assert resp == b'\x66\x66'
 
 
@@ -193,7 +197,9 @@ async def test_forward_tls_called(resolver_mocked_forward):
     resolver_mocked_forward.protocol = "tls"
     data = b'\xef\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03tls\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    resolver_mocked_forward._forward_tls.assert_awaited_once_with(data)
+    resolver_mocked_forward._forward_tls.assert_awaited_once_with(
+    data, {'address': '1.2.3.4', 'protocol': 'tls', 'hostname': '1.2.3.4'}
+)
     assert resp == b'\x77\x77'
 
 
@@ -202,7 +208,9 @@ async def test_forward_https_called(resolver_mocked_forward):
     resolver_mocked_forward.protocol = "https"
     data = b'\xca\xfe\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03doh\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    resolver_mocked_forward._forward_https.assert_awaited_once_with(data)
+    resolver_mocked_forward._forward_https.assert_awaited_once_with(
+    data, {'address': '1.2.3.4', 'protocol': 'https', 'hostname': '1.2.3.4'}
+)
     assert resp == b'\x88\x88'
 
 
@@ -213,7 +221,9 @@ async def test_forward_quic_called(resolver_mocked_forward):
     resolver_mocked_forward.protocol = "quic"
     data = b'\xde\xad\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03quic\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    resolver_mocked_forward._forward_quic.assert_awaited_once_with(data)
+    resolver_mocked_forward._forward_quic.assert_awaited_once_with(
+    data, {'address': '1.2.3.4', 'protocol': 'quic', 'hostname': '1.2.3.4'}
+)
     assert resp == b'\x99\x99'
 
 
@@ -280,9 +290,91 @@ async def test_wire_cache_prevents_forwarding(resolver_mocked_forward):
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_udp.assert_not_called()
     assert resp == cached_response
-    
+
+
 # ---------------------------------------------------------------------------
-# NEW: RateLimiter unit tests
+# Multi-upstream failover tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def resolver_multi_upstream():
+    """Resolver configured with multiple upstreams, _try_upstream mocked."""
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",  # fallback (not used when upstreams list is provided)
+        protocol="udp",
+        disable_ipv6=True,
+        cache_ttl=300,
+        cache_max_size=10,
+        upstreams=[
+            {'address': '10.0.0.1', 'protocol': 'udp', 'port': 53, 'hostname': 'ns1.example.com'},
+            {'address': '10.0.0.2', 'protocol': 'tls', 'port': 853, 'hostname': 'ns2.example.com'},
+            {'address': '10.0.0.3', 'protocol': 'https', 'port': 443, 'hostname': 'ns3.example.com'},
+        ],
+    )
+    # Replace the internal _try_upstream with a controlled mock
+    resolver._try_upstream = AsyncMock()
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_multi_upstream_first_succeeds(resolver_multi_upstream):
+    """When the first upstream responds, it's returned and no others are tried."""
+    resolver_multi_upstream._try_upstream.return_value = b'\x01\x02'
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
+    resp = await resolver_multi_upstream.forward_dns_query(data)
+    assert resp == b'\x01\x02'
+    # Only one call to _try_upstream
+    assert resolver_multi_upstream._try_upstream.call_count == 1
+    # The first call should have been with the first upstream dict
+    called_upstream = resolver_multi_upstream._try_upstream.call_args[0][0]
+    assert called_upstream['address'] == '10.0.0.1'
+
+
+@pytest.mark.asyncio
+async def test_multi_upstream_second_succeeds(resolver_multi_upstream):
+    """First upstream fails, second succeeds."""
+    resolver_multi_upstream._try_upstream.side_effect = [
+        Exception("first failure"),
+        b'\x02\x03'
+    ]
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03def\x00\x00\x01\x00\x01'
+    resp = await resolver_multi_upstream.forward_dns_query(data)
+    assert resp == b'\x02\x03'
+    assert resolver_multi_upstream._try_upstream.call_count == 2
+    calls = resolver_multi_upstream._try_upstream.call_args_list
+    # First call should have been with upstream 0, second with upstream 1
+    assert calls[0][0][0]['address'] == '10.0.0.1'
+    assert calls[1][0][0]['address'] == '10.0.0.2'
+
+
+@pytest.mark.asyncio
+async def test_multi_upstream_all_fail(resolver_multi_upstream):
+    """All upstreams fail, the last exception is raised."""
+    resolver_multi_upstream._try_upstream.side_effect = [
+        Exception("fail1"),
+        Exception("fail2"),
+        Exception("fail3"),
+    ]
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03xyz\x00\x00\x01\x00\x01'
+    with pytest.raises(Exception) as exc_info:
+        await resolver_multi_upstream.forward_dns_query(data)
+    assert "fail3" in str(exc_info.value)
+    assert resolver_multi_upstream._try_upstream.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_multi_upstream_cache_hit_skips_all(resolver_multi_upstream):
+    """If the wire cache has a valid response, no upstream is contacted."""
+    key = ("abc.def", 1, resolver_multi_upstream.protocol)
+    await resolver_multi_upstream._wire_cache_set(key, b'\xcc\xcc', ttl_seconds=60)
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x03def\x00\x00\x01\x00\x01'
+    resp = await resolver_multi_upstream.forward_dns_query(data)
+    assert resp == b'\xcc\xcc'
+    resolver_multi_upstream._try_upstream.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# RateLimiter unit tests
 # ---------------------------------------------------------------------------
 
 class TestRateLimiter:
@@ -333,7 +425,7 @@ class TestRateLimiter:
         assert all(results)
 
 # ---------------------------------------------------------------------------
-# NEW: Rate limiter config hot-reload test
+# Rate limiter config hot-reload test
 # ---------------------------------------------------------------------------
 
 class TestRateLimitConfig:

@@ -76,6 +76,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'upstream_doh_timeout': 5.0,
             'rate_limit_rps': 0.0,
             'rate_limit_burst': 0.0,
+            'upstreams': [],     # new: list of upstream server configs
         }
     config.read(path)
 
@@ -176,6 +177,42 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     rate_limit_rps: float = config.getfloat('advanced', 'rate_limit_rps', fallback=0.0)
     rate_limit_burst: float = config.getfloat('advanced', 'rate_limit_burst', fallback=0.0)
 
+    # --- NEW: Multi-upstream parsing ---
+    upstreams: List[Dict[str, Any]] = []
+    if config.has_section('upstreams') and config.has_option('upstreams', 'servers'):
+        server_names = [s.strip() for s in config.get('upstreams', 'servers').split(',') if s.strip()]
+        for name in server_names:
+            section = f'upstreams.{name}'
+            if not config.has_section(section):
+                continue
+            address = config.get(section, 'address', fallback='')
+            if not address:
+                continue
+            proto = config.get(section, 'protocol', fallback='udp').lower()
+            port_str = config.get(section, 'port', fallback=None)
+            if port_str:
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    port = None
+            else:
+                # default ports per protocol
+                if proto == 'tls':
+                    port = 853
+                elif proto == 'https':
+                    port = 443
+                elif proto == 'quic':
+                    port = 784
+                else:
+                    port = 53
+            hostname = config.get(section, 'hostname', fallback='') or address
+            upstreams.append({
+                'address': address,
+                'protocol': proto,
+                'port': port,
+                'hostname': hostname,
+            })
+
     return {
         'verbose': verbose_flag,
         'listen_ip': config.get('interface', 'listen_ip', fallback='0.0.0.0'),
@@ -235,4 +272,5 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'upstream_doh_timeout': upstream_doh_timeout,
         'rate_limit_rps': rate_limit_rps,
         'rate_limit_burst': rate_limit_burst,
+        'upstreams': upstreams,  # new: list of upstream dicts
     }

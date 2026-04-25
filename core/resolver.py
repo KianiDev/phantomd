@@ -122,6 +122,7 @@ class DNSResolver:
       - Optional certificate pinning and DNSSEC validation
       - Optional Prometheus metrics and uvloop enable
       - Integrated rate limiter (per client IP)
+      - Multi-upstream with automatic failover (configurable upstream list)
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -149,9 +150,14 @@ class DNSResolver:
                   metrics_port: int = 8000,
                   uvloop_enable: bool = False,
                   rate_limit_rps: float = 0.0,
-                  rate_limit_burst: float = 0.0) -> None:
+                  rate_limit_burst: float = 0.0,
+                  upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
+        # --- single upstream fallback ---
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
+        # --- multi-upstream list (optional) ---
+        self.upstreams: List[Dict[str, Any]] = upstreams or []
+
         self.dns_resolver_server: Optional[str] = dns_resolver_server
         self.disable_ipv6: bool = bool(disable_ipv6)
         self.verbose: bool = bool(verbose)
@@ -380,14 +386,7 @@ class DNSResolver:
     def _parse_dns_name(packet: bytes, offset: int,
                         max_depth: int = 20,
                         _depth: int = 0) -> Tuple[str, int]:
-        """Parse a DNS name from wire format. Returns (name, new_offset).
-
-        Parameters:
-            packet: full DNS message bytes
-            offset: start of the name
-            max_depth: maximum pointer chain depth (to avoid loops)
-            _depth: current recursion depth (used internally)
-        """
+        """Parse a DNS name from wire format. Returns (name, new_offset)."""
         labels = []
         while True:
             if offset >= len(packet):
@@ -733,6 +732,30 @@ class DNSResolver:
             raise
         self.logger.debug("DNSSEC validation passed for %s", qname)
 
+    # --- New: try an upstream and return response or raise ---
+    async def _try_upstream(self, upstream: Dict[str, Any], data: bytes) -> bytes:
+        """Forward a query to a single upstream and return the response."""
+        proto = upstream.get('protocol', 'udp')
+        if proto == 'udp':
+            return await self._with_retries(
+                lambda d: self._forward_udp(d, upstream), data, timeout=self.udp_timeout)
+        elif proto == 'tcp':
+            return await self._with_retries(
+                lambda d: self._forward_tcp(d, upstream), data, timeout=self.tcp_timeout)
+        elif proto == 'tls':
+            return await self._with_retries(
+                lambda d: self._forward_tls(d, upstream), data, timeout=self.tcp_timeout)
+        elif proto == 'https':
+            return await self._with_retries(
+                lambda d: self._forward_https(d, upstream), data, timeout=self.doh_timeout)
+        elif proto == 'quic':
+            if not _HAS_AIOQUIC:
+                raise RuntimeError("aioquic not available for DoQ")
+            return await self._with_retries(
+                lambda d: self._forward_quic(d, upstream), data, timeout=self.doh_timeout)
+        else:
+            raise ValueError(f"Unsupported upstream protocol: {proto}")
+
     async def forward_dns_query(self, data: bytes) -> bytes:
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
@@ -744,7 +767,6 @@ class DNSResolver:
                 ip = host_values[0]
                 try:
                     if _HAS_DNSPY:
-                        # Ensure absolute name for dnspython
                         absolute_qname = qname if qname.endswith('.') else f"{qname}."
                         from dns import message, rdatatype, rdataclass, rrset
                         resp = dns.message.make_response(dns.message.from_wire(data) if data else None)
@@ -768,45 +790,49 @@ class DNSResolver:
             self.logger.debug("wire-cache hit %s", key)
             return cached
 
-        proto = self.protocol
-        if proto == "udp":
-            resp = await self._with_retries(self._forward_udp, data, timeout=self.udp_timeout)
-        elif proto == "tcp":
-            resp = await self._with_retries(self._forward_tcp, data, timeout=self.tcp_timeout)
-        elif proto == "tls":
-            resp = await self._with_retries(self._forward_tls, data, timeout=self.tcp_timeout)
-        elif proto == "https":
-            resp = await self._with_retries(self._forward_https, data, timeout=self.doh_timeout)
-        elif proto == "quic":
-            if not _HAS_AIOQUIC:
-                raise RuntimeError("aioquic not available for DoQ")
-            resp = await self._with_retries(self._forward_quic, data, timeout=self.doh_timeout)
-        else:
-            raise ValueError(f"Unsupported protocol {proto}")
+        # --- prepare upstream list ---
+        upstream_list = self.upstreams if self.upstreams else [
+            {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
+        ]
 
-        if self.metrics_enabled and self._metrics:
+        last_exc = None
+        for upstream in upstream_list:
             try:
-                self._metrics['requests_total'].labels(proto=proto).inc()
-            except Exception:
-                pass
+                resp = await self._try_upstream(upstream, data)
+                # metrics (use protocol of the successful upstream)
+                if self.metrics_enabled and self._metrics:
+                    try:
+                        self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
+                    except Exception:
+                        pass
+                # DNSSEC validate if enabled
+                if self.dnssec_enabled and qname:
+                    try:
+                        await self._dnssec_validate(qname, resp)
+                    except Exception as e:
+                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                        raise
+                ttl = self._extract_min_ttl(resp)
+                if ttl <= 0:
+                    ttl = 30
+                await self._wire_cache_set(key, resp, ttl)
+                return resp
+            except Exception as e:
+                last_exc = e
+                self.logger.debug("upstream %s failed: %s", upstream.get('address'), e)
+                continue
 
-        if self.dnssec_enabled:
-            if qname:
-                try:
-                    await self._dnssec_validate(qname, resp)
-                except Exception as e:
-                    self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                    raise
+        self.logger.error("all upstreams failed")
+        raise last_exc or Exception("All upstreams exhausted")
 
-        ttl = self._extract_min_ttl(resp)
-        if ttl <= 0:
-            ttl = 30
-        await self._wire_cache_set(key, resp, ttl)
-        return resp
+    # --- forwarding implementations (now accept optional upstream) ---
 
-    # --- forwarding implementations ---
-    async def _forward_udp(self, data: bytes) -> bytes:
-        host, port = self._split_hostport(self.upstream_dns, default_port=53)
+    async def _forward_udp(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
+        if upstream is None:
+            host, port = self._split_hostport(self.upstream_dns, default_port=53)
+        else:
+            host = upstream['address']
+            port = upstream.get('port', 53)
         resolved = await self._resolve_upstream_ip(host)
         family = socket.AF_INET6 if self._is_ipv6_address(resolved) else socket.AF_INET
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
@@ -845,8 +871,12 @@ class DNSResolver:
         finally:
             transport.close()
 
-    async def _forward_tcp(self, data: bytes) -> bytes:
-        host, port = self._split_hostport(self.upstream_dns, default_port=53)
+    async def _forward_tcp(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
+        if upstream is None:
+            host, port = self._split_hostport(self.upstream_dns, default_port=53)
+        else:
+            host = upstream['address']
+            port = upstream.get('port', 53)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
@@ -861,17 +891,23 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
-    async def _forward_tls(self, data: bytes) -> bytes:
-        host, port = self._split_hostport(self.upstream_dns, default_port=853)
+    async def _forward_tls(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
+        if upstream is None:
+            host, port = self._split_hostport(self.upstream_dns, default_port=853)
+            hostname = host
+        else:
+            host = upstream['address']
+            port = upstream.get('port', 853)
+            hostname = upstream.get('hostname', host)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
         ssl_ctx = ssl.create_default_context()
-        reader, writer = await asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=host)
+        reader, writer = await asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=hostname)
         try:
             ssl_obj = writer.get_extra_info('ssl_object')
             if ssl_obj is not None and self.pinned_certs:
-                await self._check_cert_pins(host, ssl_obj)
+                await self._check_cert_pins(hostname, ssl_obj)
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
@@ -881,26 +917,34 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
-    async def _forward_https(self, data: bytes) -> bytes:
-        url = self.upstream_dns if (self.upstream_dns.startswith("http://") or self.upstream_dns.startswith("https://")) \
-              else (f"https://{self.upstream_dns}" if "/" in self.upstream_dns else f"https://{self.upstream_dns}/dns-query")
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        path = parsed.path or "/dns-query"
-        port = parsed.port or 443
-
+    async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
+        if upstream is None:
+            # fallback: build URL from self.upstream_dns
+            url = self.upstream_dns if (self.upstream_dns.startswith("http://") or self.upstream_dns.startswith("https://")) \
+                  else (f"https://{self.upstream_dns}" if "/" in self.upstream_dns else f"https://{self.upstream_dns}/dns-query")
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            path = parsed.path or "/dns-query"
+            port = parsed.port or 443
+            hostname = host
+        else:
+            host = upstream['address']
+            port = upstream.get('port', 443)
+            hostname = upstream.get('hostname', host)
+            path = upstream.get('path', '/dns-query')
+        
         resolved = await self._resolve_upstream_ip(host)
         ssl_ctx = ssl.create_default_context()
-        reader, writer = await asyncio.open_connection(resolved, port, ssl=ssl_ctx, server_hostname=host)
+        reader, writer = await asyncio.open_connection(resolved, port, ssl=ssl_ctx, server_hostname=hostname)
 
         try:
             ssl_obj = writer.get_extra_info('ssl_object')
             if ssl_obj is not None and self.pinned_certs:
-                await self._check_cert_pins(host, ssl_obj)
+                await self._check_cert_pins(hostname, ssl_obj)
 
             headers = [
                 f"POST {path} HTTP/1.1",
-                f"Host: {host}",
+                f"Host: {hostname}",
                 "User-Agent: phantomd/1.0",
                 "Accept: application/dns-message",
                 "Content-Type: application/dns-message",
@@ -981,8 +1025,14 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
-    async def _forward_quic(self, data: bytes) -> bytes:
-        host, port = self._split_hostport(self.upstream_dns, default_port=784)
+    async def _forward_quic(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
+        if upstream is None:
+            host, port = self._split_hostport(self.upstream_dns, default_port=784)
+            hostname = host
+        else:
+            host = upstream['address']
+            port = upstream.get('port', 784)
+            hostname = upstream.get('hostname', host)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
@@ -1045,7 +1095,7 @@ class DNSResolver:
             if self.pinned_certs:
                 der = _get_quic_cert_der(client)
                 if der:
-                    await self._check_cert_pins(host, self._DERPeerWrapper(der))
+                    await self._check_cert_pins(hostname, self._DERPeerWrapper(der))
                 else:
                     self.logger.warning("DoQ: unable to obtain peer certificate for pin-check; proceeding without")
 
@@ -1368,7 +1418,8 @@ class DNSResolver:
                       metrics_port: Optional[int] = None,
                       uvloop_enable: Optional[bool] = None,
                       rate_limit_rps: Optional[float] = None,
-                      rate_limit_burst: Optional[float] = None) -> None:
+                      rate_limit_burst: Optional[float] = None,
+                      upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -1405,7 +1456,6 @@ class DNSResolver:
             self.metrics_port = int(metrics_port)
         if uvloop_enable is not None:
             pass
-
         # Rate limiter updates
         if rate_limit_rps is not None:
             self.rate_limit_rps = rate_limit_rps
@@ -1419,6 +1469,9 @@ class DNSResolver:
                 self.rate_limiter.burst = self.rate_limit_burst
         else:
             self.rate_limiter = None
+        # Upstream list update
+        if upstreams is not None:
+            self.upstreams = upstreams
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
                          "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s",
