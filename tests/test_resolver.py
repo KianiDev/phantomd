@@ -4,16 +4,10 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch, call
 import struct
 import time
+import socket
 
-from core.resolver import DNSResolver, _HAS_CACHETOOLS, _HAS_AIOQUIC
+from core.resolver import DNSResolver, _HAS_CACHETOOLS, _HAS_AIOQUIC, RateLimiter
 
-
-# ---------------------------------------------------------------------------
-# Existing parsing / blocklist / cache / NXDOMAIN / split tests
-# (kept exactly as before – they are omitted here to save space, but must be
-#  included in the final file. See the original tests from the previous
-#  message. I'll list them in the final file below.)
-# ---------------------------------------------------------------------------
 
 class TestParsing:
     def test_parse_simple_name(self):

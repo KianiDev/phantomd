@@ -1,5 +1,6 @@
 # phantomd
 
+![Tests](https://github.com/KianiDev/phantomd/actions/workflows/tests.yml/badge.svg)
 A lightweight, modular DNS proxy with filtering and secure upstream support.
 
 ## ✨ Features
