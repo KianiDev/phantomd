@@ -25,11 +25,12 @@ class TestParsing:
             b'\x00' * 12 +
             b'\x07example\x03com\x00' +
             b'\x00\x01\x00\x01' +
-            b'\xc0\x0c'   # pointer to offset 12
+            b'\xc0\x0c'   # pointer to offset 12 (0x0c)
         )
-        name, offset = DNSResolver._parse_dns_name(data, 20)
+        # The pointer is at offset 29 (12+13+4). Parsing from there should yield "example.com"
+        name, offset = DNSResolver._parse_dns_name(data, 29)
         assert name == "example.com"
-        assert offset == 22
+        assert offset == 31   # 29 + 2 bytes for pointer
 
     def test_parse_pointer_loop(self):
         data = bytearray(b'\x00' * 20)

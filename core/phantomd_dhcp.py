@@ -716,7 +716,7 @@ class DHCPServer:
             OPTION_MESSAGE_TYPE: bytes([DHCPNAK]),
             OPTION_SERVER_ID: socket.inet_aton(self.server_ip if self.server_ip else '0.0.0.0')
         }
-        return header + self.build_options(opts)
+        return header + MAGIC_COOKIE + self.build_options(opts)   # <-- add MAGIC_COOKIE
 
     def _allow_request(self, mac: str, src_ip: str) -> bool:
         now = time.time()
