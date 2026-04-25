@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Dict, Set, Tuple, Optional, Any
 
-from core.resolver import DNSResolver
+from core.resolver import DNSResolver, RateLimiter
 from utils.ListUpdater import fetch_blocklists, periodic_fetch
 
 import dns.message
@@ -39,6 +39,14 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
     async def _handle(self, data: bytes, addr: Tuple[str, int]) -> None:
         resolver = self.holder.resolver  # always read the latest resolver
+        client_ip = addr[0]
+
+        # --- Rate limiting ---
+        if resolver.rate_limiter is not None:
+            if not await resolver.rate_limiter.is_allowed(client_ip):
+                logging.debug("Rate‑limited UDP query from %s", client_ip)
+                return
+
         try:
             qname: Optional[str] = None
             request_msg: Optional[dns.message.Message] = None
@@ -105,11 +113,20 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     """Handle a single TCP DNS query."""
     peer = writer.get_extra_info('peername')
     logging.debug(f"Accepted TCP connection from {peer}")
+    resolver = holder.resolver  # always read the latest resolver
+    client_ip = peer[0] if peer else "unknown"
+
+    # --- Rate limiting ---
+    if resolver.rate_limiter is not None:
+        if not await resolver.rate_limiter.is_allowed(client_ip):
+            logging.debug("Rate‑limited TCP query from %s", client_ip)
+            writer.close()
+            return
+
     try:
         length_bytes = await reader.readexactly(2)
         length = int.from_bytes(length_bytes, 'big')
         data = await reader.readexactly(length)
-        resolver = holder.resolver  # always read the latest resolver
         qname: Optional[str] = None
         request_msg: Optional[dns.message.Message] = None
         qtype: Optional[int] = None
@@ -197,6 +214,8 @@ async def reload_resolver(holder: ResolverHolder,
         trust_anchors=config.get("trust_anchors_file"),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),
+        rate_limit_rps=config.get("rate_limit_rps"),
+        rate_limit_burst=config.get("rate_limit_burst"),
     )
 
     if blocklists:
@@ -244,7 +263,9 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      upstream_initial_backoff: float = 0.1,
                      upstream_udp_timeout: float = 2.0,
                      upstream_tcp_timeout: float = 5.0,
-                     upstream_doh_timeout: float = 5.0) -> None:
+                     upstream_doh_timeout: float = 5.0,
+                     rate_limit_rps: float = 0.0,
+                     rate_limit_burst: float = 0.0) -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -268,6 +289,8 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         metrics_enabled=metrics_enabled,
         metrics_port=metrics_port,
         uvloop_enable=uvloop_enable,
+        rate_limit_rps=rate_limit_rps,
+        rate_limit_burst=rate_limit_burst,
     )
 
     # Mutable holder for atomic resolver swaps

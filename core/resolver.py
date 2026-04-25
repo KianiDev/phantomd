@@ -58,7 +58,6 @@ except Exception:
 
 class AsyncTTLCache:
     """Async-capable TTL cache with optional size limit."""
-
     def __init__(self, maxsize: int = 1024, ttl: int = 300) -> None:
         self._data: Dict[str, Tuple[Any, float]] = {}
         self._ttl: int = ttl
@@ -66,7 +65,6 @@ class AsyncTTLCache:
         self._lock: asyncio.Lock = asyncio.Lock()
 
     async def get(self, key: str) -> Optional[Any]:
-        """Retrieve a value if not expired."""
         async with self._lock:
             v = self._data.get(key)
             if not v:
@@ -78,22 +76,40 @@ class AsyncTTLCache:
             return value
 
     async def set(self, key: str, value: Any) -> None:
-        """Store a value with TTL."""
         async with self._lock:
             if len(self._data) >= self._max:
-                # evict oldest by expiry
                 oldest = min(self._data.items(), key=lambda kv: kv[1][1])[0]
                 del self._data[oldest]
             self._data[key] = (value, time.time() + self._ttl)
 
     async def delete(self, key: str) -> None:
-        """Remove a key if it exists."""
         async with self._lock:
             try:
                 if key in self._data:
                     del self._data[key]
             except Exception:
                 pass
+
+
+class RateLimiter:
+    """Token-bucket rate limiter for DNS queries (per IP)."""
+    def __init__(self, rate: float, burst: float) -> None:
+        self.rate: float = rate
+        self.burst: float = burst
+        self._buckets: Dict[str, Tuple[float, float]] = {}
+        self._lock: asyncio.Lock = asyncio.Lock()
+
+    async def is_allowed(self, key: str) -> bool:
+        """Check whether a request identified by `key` (e.g., client IP) is allowed under the rate limit."""
+        async with self._lock:
+            now = time.time()
+            tokens, last = self._buckets.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens >= 1.0:
+                self._buckets[key] = (tokens - 1.0, now)
+                return True
+            self._buckets[key] = (tokens, now)
+            return False
 
 
 class DNSResolver:
@@ -105,6 +121,7 @@ class DNSResolver:
       - DoH over TLS with SNI preserved (manual HTTP/1.1 POST)
       - Optional certificate pinning and DNSSEC validation
       - Optional Prometheus metrics and uvloop enable
+      - Integrated rate limiter (per client IP)
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -130,7 +147,9 @@ class DNSResolver:
                   trust_anchors: Optional[Union[Dict[str, str], str]] = None,
                   metrics_enabled: bool = False,
                   metrics_port: int = 8000,
-                  uvloop_enable: bool = False) -> None:
+                  uvloop_enable: bool = False,
+                  rate_limit_rps: float = 0.0,
+                  rate_limit_burst: float = 0.0) -> None:
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
         self.dns_resolver_server: Optional[str] = dns_resolver_server
@@ -145,24 +164,21 @@ class DNSResolver:
 
         # cache
         if _HAS_CACHETOOLS:
-            self._dns_cache: Union[TTLCache, AsyncTTLCache] = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)  # type: ignore[union-attr]
-            self._wire_cache: Union[TTLCache, AsyncTTLCache] = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)  # type: ignore[union-attr]
+            self._dns_cache: Any = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+            self._wire_cache: Any = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._cache_is_sync: bool = True
         else:
             self._dns_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._wire_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
-            self._cache_is_sync = False
+            self._cache_is_sync: bool = False
 
-        # Lock for wire cache operations (safe concurrent access)
         self._lock: asyncio.Lock = asyncio.Lock()
 
-        # timeouts & retry policy
         self.doh_timeout: float = doh_timeout
         self.udp_timeout: float = udp_timeout
         self.tcp_timeout: float = tcp_timeout
         self.retries: int = max(1, int(retries))
 
-        # file logging (optional)
         self.dns_logging_enabled: bool = dns_logging_enabled
         if dns_logging_enabled:
             try:
@@ -182,16 +198,12 @@ class DNSResolver:
         else:
             self._file_logger = None
 
-        # certificate pinning map: hostname -> sha256 hex fingerprint (of DER cert)
         self.pinned_certs: Dict[str, str] = pinned_certs or {}
-
-        # DNSSEC config
         self.dnssec_enabled: bool = bool(dnssec_enabled)
-        self.trust_anchors: Union[Dict[str, str], str, None] = trust_anchors or {}
-        self._dnssec_raw_anchors: Optional[Dict] = None
+        self.trust_anchors: Any = trust_anchors or {}
+        self._dnssec_raw_anchors: Optional[Any] = None
         self._dnssec_keyring: Optional[Any] = None
 
-        # Prometheus metrics (optional)
         self.metrics_enabled: bool = bool(metrics_enabled) and _HAS_PROM
         self._metrics: Optional[Dict[str, Any]] = None
         if self.metrics_enabled:
@@ -213,7 +225,6 @@ class DNSResolver:
             except Exception:
                 self._metrics = None
 
-        # optionally enable uvloop for performance
         if uvloop_enable and _HAS_UVLOOP:
             try:
                 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -221,14 +232,18 @@ class DNSResolver:
             except Exception as e:
                 self.logger.warning("Failed to enable uvloop: %s", e)
 
-        # blocklist structure (fast check). can be updated via set_blocklist()/add_blocked()
         self._blocklist_exact: Set[str] = set()
         self._blocklist_suffix: Set[str] = set()
-        # optional hosts map: exact domain -> tuple of fields (e.g. IP)
         self._hosts_map: Dict[str, Tuple[str, ...]] = {}
-
-        # default block action
         self._block_action: str = 'NXDOMAIN'
+
+        # --- Rate limiter ---
+        self.rate_limit_rps: float = rate_limit_rps
+        self.rate_limit_burst: float = rate_limit_burst
+        if rate_limit_rps > 0 and rate_limit_burst > 0:
+            self.rate_limiter: Optional[RateLimiter] = RateLimiter(rate_limit_rps, rate_limit_burst)
+        else:
+            self.rate_limiter = None
 
     # ---------- blocklist helpers ----------
     def set_blocklist(self, domains: Iterable[str]) -> None:
@@ -311,7 +326,6 @@ class DNSResolver:
 
     # ---------- wire-cache helpers ----------
     async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[bytes]:
-        """Return cached wire response bytes or None. Key should be (qname, qtype)."""
         try:
             async with self._lock:
                 if self._cache_is_sync:
@@ -323,7 +337,6 @@ class DNSResolver:
             return None
 
     async def _wire_cache_set(self, key: Tuple[str, int, str], response_bytes: bytes, ttl_seconds: int) -> None:
-        """Store wire response with TTL."""
         try:
             expiry = time.time() + max(1, int(ttl_seconds or 1))
             val = (response_bytes, expiry)
@@ -337,7 +350,6 @@ class DNSResolver:
             self.logger.debug("wire cache set error %s: %s", key, e)
 
     async def _wire_cache_get_valid(self, key: Tuple[str, int, str]) -> Optional[bytes]:
-        """Return bytes if still valid, else None. Handles tuple expiry."""
         try:
             async with self._lock:
                 if self._cache_is_sync:
@@ -365,7 +377,6 @@ class DNSResolver:
     # ---------- parsing helpers ----------
     @staticmethod
     def _parse_dns_name(packet: bytes, offset: int, max_depth: int = 20) -> Tuple[str, int]:
-        """Parse a DNS name from wire format. Returns (name, new_offset)."""
         labels = []
         depth = 0
         while True:
@@ -396,7 +407,6 @@ class DNSResolver:
         return name, offset
 
     def _extract_qname_from_wire(self, data: bytes) -> Optional[str]:
-        """Safely extract the question qname from a DNS wire-format message."""
         try:
             if not data or len(data) < 12:
                 return None
@@ -418,7 +428,6 @@ class DNSResolver:
             return None
 
     def _make_nxdomain_response(self, query_data: bytes) -> bytes:
-        """Return NXDOMAIN wire response preserving TID, question section and RD flag."""
         if not query_data or len(query_data) < 12:
             tid = 0
             qpart = b''
@@ -436,15 +445,14 @@ class DNSResolver:
         header = (
             tid.to_bytes(2, 'big') +
             flags.to_bytes(2, 'big') +
-            (1).to_bytes(2, 'big') +  # QDCOUNT
-            (0).to_bytes(2, 'big') +  # ANCOUNT
-            (0).to_bytes(2, 'big') +  # NSCOUNT
-            (0).to_bytes(2, 'big')    # ARCOUNT
+            (1).to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big')
         )
         return header + qpart
 
     def _build_local_A_response(self, query_data: bytes, ip: str) -> bytes:
-        """Build a minimal A record response pointing to the given IPv4 address."""
         if not query_data or len(query_data) < 12:
             return b''
         tid = int.from_bytes(query_data[0:2], 'big')
@@ -470,7 +478,6 @@ class DNSResolver:
         return header + qpart + answer
 
     def _extract_min_ttl(self, response: bytes) -> int:
-        """Return minimum TTL present in the answer section (or a default)."""
         try:
             if not response or len(response) < 12:
                 return 0
@@ -497,11 +504,9 @@ class DNSResolver:
             return 0
 
     def _parse_rr_name(self, response: bytes, offset: int) -> Tuple[str, int]:
-        """Parse and return the resource record name from a DNS response."""
         return self._parse_dns_name(response, offset)
 
     async def _cache_get(self, key: Tuple[str, int, str]) -> Optional[str]:
-        """Retrieve from cache. Logs hit/miss at DEBUG level."""
         try:
             if self._cache_is_sync:
                 val = self._dns_cache.get(key)  # type: ignore[attr-defined]
@@ -517,7 +522,6 @@ class DNSResolver:
             return None
 
     async def _cache_set(self, key: Tuple[str, int, str], value: str) -> None:
-        """Set cache entry and log at DEBUG."""
         try:
             if self._cache_is_sync:
                 self._dns_cache[key] = value  # type: ignore[index]
@@ -528,7 +532,6 @@ class DNSResolver:
             self.logger.debug("cache set error for %s: %s", key, e)
 
     async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float) -> bytes:
-        """Run fn(data) with retries, exponential backoff, and timeout."""
         backoff = 0.1
         last_exc: Optional[Exception] = None
         for attempt in range(self.retries):
@@ -562,7 +565,6 @@ class DNSResolver:
         raise last_exc or Exception("Unknown forward error")
 
     def _log_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
-        """Log a DNS event to console and optionally to file."""
         msg = f"{status}\tqname={qname}\tclient={client}\t{details or ''}"
         if status.startswith("Blocked"):
             self.logger.info(msg)
@@ -575,11 +577,9 @@ class DNSResolver:
                 pass
 
     def log_dns_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
-        """Public wrapper for internal _log_event."""
         return self._log_event(status, qname, client, details)
 
     async def _check_cert_pins(self, hostname: str, ssl_obj: Any) -> None:
-        """Verify peer certificate against pinned_certs (sha256 of DER cert)."""
         if not self.pinned_certs:
             return
         self.logger.debug("checking certificate pin for %s", hostname)
@@ -598,7 +598,6 @@ class DNSResolver:
             raise
 
     def _load_trust_anchors(self) -> None:
-        """Load trust anchors from configured path into memory."""
         if not self.trust_anchors:
             return
         path = None
@@ -660,7 +659,6 @@ class DNSResolver:
             self.logger.warning("failed to load trust anchors from %s: %s", path, e)
 
     async def _dnssec_validate(self, qname: str, response_wire: bytes) -> None:
-        """DNSSEC validation using dnspython in a thread executor."""
         if not self.dnssec_enabled:
             return
         if not _HAS_DNSPY:
@@ -680,7 +678,7 @@ class DNSResolver:
                 rrsig_by_name: Dict[Any, Any] = {}
                 for rr in msg.answer:
                     if rr.rdtype == dns.rdatatype.RRSIG:
-                        rrsig_by_name.setdefault(rr.name, []).append(rr)  # fixed typo
+                        rrsig_by_name.setdefault(rr.name, []).append(rr)
                 for rrset in msg.answer:
                     if rrset.rdtype == dns.rdatatype.RRSIG:
                         continue
@@ -725,12 +723,10 @@ class DNSResolver:
         self.logger.debug("DNSSEC validation passed for %s", qname)
 
     async def forward_dns_query(self, data: bytes) -> bytes:
-        """Top-level: check hosts map, blocklist, wire cache, forward to upstream, DNSSEC validate, store in wire cache."""
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
         key = (qname or "", qtype, self.protocol)
 
-        # hosts map check
         host_values = self.get_host_for(qname)
         if host_values:
             if qtype == 1 and len(host_values) > 0:
@@ -747,7 +743,6 @@ class DNSResolver:
                 except Exception:
                     self.logger.exception("failed to synthesize hosts map response for %s", qname)
 
-        # blocklist check
         if self.is_blocked(qname):
             self._log_event("Blocked (internal)", qname, None, "blocklist")
             try:
@@ -755,13 +750,11 @@ class DNSResolver:
             except Exception:
                 return self._make_nxdomain_response(data)
 
-        # check wire cache
         cached = await self._wire_cache_get_valid(key)
         if cached:
             self.logger.debug("wire-cache hit %s", key)
             return cached
 
-        # forward by protocol
         proto = self.protocol
         if proto == "udp":
             resp = await self._with_retries(self._forward_udp, data, timeout=self.udp_timeout)
@@ -799,7 +792,6 @@ class DNSResolver:
         return resp
 
     # --- forwarding implementations ---
-
     async def _forward_udp(self, data: bytes) -> bytes:
         host, port = self._split_hostport(self.upstream_dns, default_port=53)
         resolved = await self._resolve_upstream_ip(host)
@@ -977,7 +969,6 @@ class DNSResolver:
             await writer.wait_closed()
 
     async def _forward_quic(self, data: bytes) -> bytes:
-        """Forward DNS query over QUIC (DoQ) with robust error handling."""
         host, port = self._split_hostport(self.upstream_dns, default_port=784)
         resolved = await self._resolve_upstream_ip(host)
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
@@ -1082,9 +1073,7 @@ class DNSResolver:
             return resp[2:2+resp_len]
 
     # --- name resolution helpers ---
-
     def _split_hostport(self, hostport: str, default_port: int = 53) -> Tuple[str, int]:
-        """Split 'host:port' and handle IPv6 '[::1]:port' notation."""
         if not hostport:
             return "", default_port
         host = hostport
@@ -1117,14 +1106,12 @@ class DNSResolver:
             return False
 
     class _DERPeerWrapper:
-        """Small wrapper to present a .getpeercert(binary_form=True) API when we only have DER bytes."""
         def __init__(self, der: bytes) -> None:
             self._der = der
         def getpeercert(self, binary_form: bool = False) -> Optional[bytes]:
             return self._der if binary_form else None
 
     async def _resolve_upstream_ip(self, hostname: str) -> str:
-        """Return a single IP address for hostname, respecting disable_ipv6 and using cache."""
         key = (hostname, bool(self.disable_ipv6))
         cached = await self._cache_get(key)
         if cached:
@@ -1166,7 +1153,6 @@ class DNSResolver:
         raise Exception(f"Unable to resolve upstream hostname: {hostname}")
 
     async def _udp_query_a_or_aaaa(self, resolver_ip: str, resolver_port: int, qname: str, qtype: int = 1) -> Optional[str]:
-        """Perform minimal DNS query (A then AAAA) against resolver_ip:port using non-blocking sockets."""
         self.logger.debug("udp lookup of %s via %s:%d", qname, resolver_ip, resolver_port)
         loop = asyncio.get_running_loop()
         try:
@@ -1228,7 +1214,6 @@ class DNSResolver:
 
     # ---------- block action helpers ----------
     def set_block_action(self, action: Optional[str]) -> None:
-        """Set how the server should respond for blocked domains: 'ZEROIP', 'NXDOMAIN', or 'REFUSED'."""
         try:
             if action is None:
                 action = 'NXDOMAIN'
@@ -1237,11 +1222,9 @@ class DNSResolver:
             self._block_action = 'NXDOMAIN'
 
     def get_block_action(self) -> str:
-        """Return currently configured block action (default 'NXDOMAIN')."""
         return getattr(self, '_block_action', 'NXDOMAIN')
 
     def build_block_response(self, request_data: bytes, action: Optional[str] = None) -> bytes:
-        """Build a wire-format DNS response for a blocked query according to action."""
         use_action = action or self.get_block_action()
         try:
             if _HAS_DNSPY:
@@ -1370,7 +1353,9 @@ class DNSResolver:
                       trust_anchors: Optional[Union[Dict[str, str], str]] = None,
                       metrics_enabled: Optional[bool] = None,
                       metrics_port: Optional[int] = None,
-                      uvloop_enable: Optional[bool] = None) -> None:
+                      uvloop_enable: Optional[bool] = None,
+                      rate_limit_rps: Optional[float] = None,
+                      rate_limit_burst: Optional[float] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -1382,7 +1367,7 @@ class DNSResolver:
             self.verbose = bool(verbose)
             self.logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
         if cache_ttl is not None:
-            pass  # new entries will use the new TTL via the cache object (if recreated)
+            pass
         if cache_max_size is not None:
             pass
         if doh_timeout is not None:
@@ -1406,9 +1391,24 @@ class DNSResolver:
         if metrics_port is not None:
             self.metrics_port = int(metrics_port)
         if uvloop_enable is not None:
-            pass  # uvloop requires restart
+            pass
+
+        # Rate limiter updates
+        if rate_limit_rps is not None:
+            self.rate_limit_rps = rate_limit_rps
+        if rate_limit_burst is not None:
+            self.rate_limit_burst = rate_limit_burst
+        if self.rate_limit_rps > 0 and self.rate_limit_burst > 0:
+            if self.rate_limiter is None:
+                self.rate_limiter = RateLimiter(self.rate_limit_rps, self.rate_limit_burst)
+            else:
+                self.rate_limiter.rate = self.rate_limit_rps
+                self.rate_limiter.burst = self.rate_limit_burst
+        else:
+            self.rate_limiter = None
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
-                         "disable_ipv6=%s, verbose=%s",
+                         "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s",
                          self.upstream_dns, self.protocol,
-                         self.disable_ipv6, self.verbose)
+                         self.disable_ipv6, self.verbose,
+                         self.rate_limit_rps, self.rate_limit_burst)

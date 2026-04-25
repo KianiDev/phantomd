@@ -7,12 +7,11 @@ import asyncio
 import signal
 import concurrent.futures
 from typing import Any, Dict, Optional, List, Tuple, Callable, Awaitable
-from core.resolver import DNSResolver
+
 from core.dserver import run_server, reload_resolver, ResolverHolder
+from core.resolver import DNSResolver
 from utils.ListUpdater import fetch_blocklists_sync
 
-# NOTE: don't import DHCP at module import time. Import lazily when enabled so
-# incomplete DHCP-related optional deps don't break the whole process.
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="phantomd DNS server")
@@ -22,26 +21,22 @@ def main() -> None:
     config: Dict[str, Any] = load_config()
     verbose: bool = args.verbose or config.get("verbose", False)
 
-    # Configure logging as early as possible so all subsequent messages are captured.
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format='[%(levelname)s] %(message)s'
     )
 
-    # Validate mandatory configuration keys
     upstream_dns: Optional[str] = config.get("upstream_dns")
     protocol: str = config.get("protocol", "udp")
     if not upstream_dns:
         logging.critical("Missing required configuration key: 'upstream_dns'")
         sys.exit(1)
 
-    # honor listen_loopback_only: override listen_ip to localhost when requested
     listen_loopback: bool = bool(config.get('listen_loopback_only', False))
     listen_ip_cfg: Optional[str] = config.get('listen_ip')
     if listen_loopback:
         listen_ip_cfg = '127.0.0.1'
 
-    # privileged bind requirement check
     require_priv: bool = bool(config.get('require_privileged_bind', False))
     listen_port_cfg: int = int(config.get('listen_port', 53))
     if require_priv and listen_port_cfg < 1024:
@@ -56,7 +51,6 @@ def main() -> None:
     for key, value in config.items():
         logging.info(f"{key}: {value}")
 
-    # Move uvloop activation to this level so it takes effect *before* asyncio.run()
     if config.get("uvloop_enable", False):
         try:
             import uvloop
@@ -65,7 +59,7 @@ def main() -> None:
         except Exception as e:
             logging.warning("Failed to enable uvloop: %s", e)
 
-    # Extract typed configuration values once (avoids dead dict)
+    # Extract typed configuration values
     dns_resolver_server: str = str(config.get("dns_resolver_server") or "")
     disable_ipv6_flag: bool = bool(config.get("disable_ipv6", False))
     dns_cache_ttl_val: int = int(config.get("dns_cache_ttl", 300))
@@ -84,6 +78,10 @@ def main() -> None:
     upstream_udp_timeout_val: float = float(config.get("upstream_udp_timeout", 2.0))
     upstream_tcp_timeout_val: float = float(config.get("upstream_tcp_timeout", 5.0))
     upstream_doh_timeout_val: float = float(config.get("upstream_doh_timeout", 5.0))
+
+    # NEW: DNS rate‑limiting values
+    rate_limit_rps_val: float = float(config.get("rate_limit_rps", 0.0))
+    rate_limit_burst_val: float = float(config.get("rate_limit_burst", 0.0))
 
     # DHCP configuration
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
@@ -111,7 +109,6 @@ def main() -> None:
                     server_ip=None,
                     lease_db_path=dhcp_cfg.get('lease_db_path')
                 )
-                # configure DHCP instance with extra runtime options parsed from config
                 try:
                     dhcp.arp_probe_enable = bool(config.get('dhcp_arp_probe_enable', True))
                     dhcp.arp_probe_timeout = int(config.get('dhcp_arp_probe_timeout', 1))
@@ -134,7 +131,6 @@ def main() -> None:
                 except Exception:
                     logging.debug('Failed to set DHCP runtime attributes from config', exc_info=True)
 
-                # Prepare a robust start callable; don't assume specific signature
                 start_method = getattr(dhcp, 'start', None) or getattr(dhcp, 'serve', None) or getattr(dhcp, 'run', None)
                 if not callable(start_method):
                     logging.warning('DHCP server has no known start method; skipping DHCP startup')
@@ -180,8 +176,6 @@ def main() -> None:
                 logging.exception("Failed to initialize DHCP server: %s", e)
 
     async def _run_all() -> None:
-        # Start DNS server and optional DHCP server as tasks.
-        # The initial blocklist fetch is performed asynchronously with a timeout to avoid blocking.
         block_cfg: Dict[str, Any] = config.get('blocklists', {})
         if block_cfg and block_cfg.get('enabled'):
             urls: List[str] = block_cfg.get('urls', [])
@@ -227,21 +221,20 @@ def main() -> None:
             upstream_udp_timeout=upstream_udp_timeout_val,
             upstream_tcp_timeout=upstream_tcp_timeout_val,
             upstream_doh_timeout=upstream_doh_timeout_val,
+            rate_limit_rps=rate_limit_rps_val,
+            rate_limit_burst=rate_limit_burst_val,
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None
         if dhcp_start_fn:
             dhcp_task = asyncio.create_task(dhcp_start_fn())
 
-        # --- Set up SIGHUP handler for config reload ---
         loop = asyncio.get_running_loop()
 
         def _reload_handler() -> None:
-            """Synchronous callback invoked by the event loop when SIGHUP is received."""
             logging.info("SIGHUP received – reloading configuration...")
             try:
                 new_config = load_config()
-                # Use the stored resolver reference from run_server
                 holder: ResolverHolder = run_server.holder
                 resolver: DNSResolver = run_server.resolver
                 blocklists_cfg: Dict[str, Any] = new_config.get('blocklists', {})
@@ -255,7 +248,6 @@ def main() -> None:
         except (NotImplementedError, RuntimeError):
             logging.debug("Signal handlers not supported on this platform (Windows); config reload via signal is disabled")
 
-        # Gather tasks; log errors but do not cancel other tasks on failure.
         tasks: List[asyncio.Task[Any]] = [dns_task]
         if dhcp_task:
             tasks.append(dhcp_task)

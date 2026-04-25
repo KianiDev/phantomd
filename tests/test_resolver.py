@@ -287,3 +287,88 @@ async def test_wire_cache_prevents_forwarding(resolver_mocked_forward):
     # Must not have called any forward method
     resolver_mocked_forward._forward_udp.assert_not_called()
     assert resp == b'\xcc\xcc'
+    
+# ---------------------------------------------------------------------------
+# NEW: RateLimiter unit tests
+# ---------------------------------------------------------------------------
+
+class TestRateLimiter:
+    @pytest.mark.asyncio
+    async def test_allow_within_burst(self):
+        limiter = RateLimiter(10.0, 5.0)
+        # first burst of 5 should all pass
+        for _ in range(5):
+            assert await limiter.is_allowed("client1")
+
+    @pytest.mark.asyncio
+    async def test_deny_after_burst(self):
+        limiter = RateLimiter(10.0, 3.0)
+        for _ in range(3):
+            assert await limiter.is_allowed("client1")
+        # 4th should fail
+        assert not await limiter.is_allowed("client1")
+
+    @pytest.mark.asyncio
+    async def test_tokens_regenerate_over_time(self):
+        limiter = RateLimiter(100.0, 3.0)  # high rate to refill quickly
+        key = "client2"
+        for _ in range(3):
+            assert await limiter.is_allowed(key)
+        assert not await limiter.is_allowed(key)
+        # wait a bit for tokens to regenerate (rate=100, so 0.05s gives ~5 tokens)
+        await asyncio.sleep(0.05)
+        assert await limiter.is_allowed(key)
+
+    @pytest.mark.asyncio
+    async def test_different_keys_independent(self):
+        limiter = RateLimiter(10.0, 1.0)
+        assert await limiter.is_allowed("clientA")
+        assert not await limiter.is_allowed("clientA")
+        # clientB should still be allowed
+        assert await limiter.is_allowed("clientB")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_access(self):
+        limiter = RateLimiter(1000.0, 100.0)
+        key = "client3"
+        # simulate concurrent requests
+        async def consume():
+            return await limiter.is_allowed(key)
+        tasks = [consume() for _ in range(50)]
+        results = await asyncio.gather(*tasks)
+        # All should pass because burst is 100
+        assert all(results)
+
+# ---------------------------------------------------------------------------
+# NEW: Rate limiter config hot-reload test
+# ---------------------------------------------------------------------------
+
+class TestRateLimitConfig:
+    def test_update_config_disables_limiter(self, resolver_no_network):
+        # start with limiter enabled
+        resolver_no_network.rate_limiter = RateLimiter(10.0, 20.0)
+        resolver_no_network.rate_limit_rps = 10.0
+        resolver_no_network.rate_limit_burst = 20.0
+
+        # disable via update
+        resolver_no_network.update_config(rate_limit_rps=0.0, rate_limit_burst=0.0)
+        assert resolver_no_network.rate_limiter is None
+        assert resolver_no_network.rate_limit_rps == 0.0
+        assert resolver_no_network.rate_limit_burst == 0.0
+
+    def test_update_config_enables_limiter(self, resolver_no_network):
+        # start disabled
+        resolver_no_network.rate_limiter = None
+        resolver_no_network.update_config(rate_limit_rps=50.0, rate_limit_burst=100.0)
+        assert resolver_no_network.rate_limiter is not None
+        assert resolver_no_network.rate_limiter.rate == 50.0
+        assert resolver_no_network.rate_limiter.burst == 100.0
+
+    def test_update_config_updates_existing_limiter(self, resolver_no_network):
+        limiter = RateLimiter(10.0, 20.0)
+        resolver_no_network.rate_limiter = limiter
+        resolver_no_network.update_config(rate_limit_rps=30.0, rate_limit_burst=40.0)
+        # should be the same object, just updated
+        assert resolver_no_network.rate_limiter is limiter
+        assert limiter.rate == 30.0
+        assert limiter.burst == 40.0

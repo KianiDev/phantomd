@@ -74,6 +74,8 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'upstream_udp_timeout': 2.0,
             'upstream_tcp_timeout': 5.0,
             'upstream_doh_timeout': 5.0,
+            'rate_limit_rps': 0.0,
+            'rate_limit_burst': 0.0,
         }
     config.read(path)
 
@@ -82,9 +84,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     block_urls: str = config.get('blocklists', 'urls', fallback='')
     block_interval: int = config.getint('blocklists', 'interval_seconds', fallback=86400)
     block_action: str = config.get('blocklists', 'action', fallback='NXDOMAIN').upper()
-    # normalize urls into list
     urls_list: List[str] = [u.strip() for u in block_urls.split(',') if u.strip()]
-    # local blocklist dir & reload behavior
     block_local_dir: str = config.get('blocklists', 'local_blocklist_dir', fallback='blocklists')
     block_reload_on_change: bool = config.getboolean('blocklists', 'reload_on_change', fallback=True)
 
@@ -114,7 +114,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     dns_log_retention_days: int = config.getint('logging', 'dns_log_retention_days', fallback=7)
     dns_log_dir: str = config.get('logging', 'dns_log_dir', fallback='/var/log/phantomd')
     dns_log_prefix: str = config.get('logging', 'dns_log_prefix', fallback='dns-log')
-    # convenience: verbose also under logging
     verbose_flag: bool = config.getboolean('logging', 'verbose', fallback=False)
 
     # DHCP settings
@@ -125,10 +124,8 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     dhcp_end: str = config.get('dhcp', 'end_ip', fallback='192.168.1.200')
     dhcp_lease_ttl: int = config.getint('dhcp', 'lease_ttl', fallback=86400)
     dhcp_static: str = config.get('dhcp', 'static_leases', fallback='')
-    # rate limiting
     dhcp_rate_limit_rps: float = config.getfloat('dhcp', 'dhcp_rate_limit_rps', fallback=5.0)
     dhcp_rate_limit_burst: int = config.getint('dhcp', 'dhcp_rate_limit_burst', fallback=20)
-    # DHCP advanced options
     dhcp_arp_probe_enable: bool = config.getboolean('dhcp', 'arp_probe_enable', fallback=True)
     dhcp_arp_probe_timeout: int = config.getint('dhcp', 'arp_probe_timeout', fallback=1)
     dhcp_privilege_drop_user: str = config.get('dhcp', 'privilege_drop_user', fallback='nobody')
@@ -137,7 +134,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     dhcp_test_bind_port: int = config.getint('dhcp', 'bind_port', fallback=67)
     lease_sqlite_enabled: bool = config.getboolean('dhcp', 'lease_sqlite_enabled', fallback=True)
     lease_sqlite_path: str = config.get('dhcp', 'lease_sqlite_path', fallback='/var/lib/phantomd/dhcp_leases.sqlite')
-    # parse static leases in format mac=ip,mac=ip
     static_leases: Dict[str, str] = {}
     for item in [s.strip() for s in dhcp_static.split(',') if s.strip()]:
         try:
@@ -145,14 +141,12 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             static_leases[mac.strip().lower()] = ip.strip()
         except Exception:
             continue
-    # lease DB path - normalize key used across codebase
     dhcp_lease_db: str = config.get('dhcp', 'dhcp_lease_db', fallback='/var/lib/phantomd/dhcp_leases.json')
 
     # Security and advanced options
     dns_resolver_server: str = config.get('upstream', 'dns_resolver_server', fallback='1.1.1.1:53')
     dnssec_enabled: bool = config.getboolean('upstream', 'dnssec_enabled', fallback=False)
     trust_anchors_file: str = config.get('upstream', 'trust_anchors_file', fallback='')
-    # pinned certs: comma separated host=fingerprint (sha256 hex)
     pinned_raw: str = config.get('upstream', 'pinned_certs', fallback='')
     pinned_dict: Dict[str, str] = {}
     for item in [s.strip() for s in pinned_raw.split(',') if s.strip()]:
@@ -179,6 +173,8 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     upstream_udp_timeout: float = config.getfloat('advanced', 'upstream_udp_timeout', fallback=2.0)
     upstream_tcp_timeout: float = config.getfloat('advanced', 'upstream_tcp_timeout', fallback=5.0)
     upstream_doh_timeout: float = config.getfloat('advanced', 'upstream_doh_timeout', fallback=5.0)
+    rate_limit_rps: float = config.getfloat('advanced', 'rate_limit_rps', fallback=0.0)
+    rate_limit_burst: float = config.getfloat('advanced', 'rate_limit_burst', fallback=0.0)
 
     return {
         'verbose': verbose_flag,
@@ -237,4 +233,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'upstream_udp_timeout': upstream_udp_timeout,
         'upstream_tcp_timeout': upstream_tcp_timeout,
         'upstream_doh_timeout': upstream_doh_timeout,
+        'rate_limit_rps': rate_limit_rps,
+        'rate_limit_burst': rate_limit_burst,
     }
