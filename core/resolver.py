@@ -338,7 +338,8 @@ class DNSResolver:
 
     async def _wire_cache_set(self, key: Tuple[str, int, str], response_bytes: bytes, ttl_seconds: int) -> None:
         try:
-            expiry = time.time() + max(1, int(ttl_seconds or 1))
+            # Use the TTL directly, allowing zero for immediate expiry
+            expiry = time.time() + max(0, int(ttl_seconds or 0))
             val = (response_bytes, expiry)
             async with self._lock:
                 if self._cache_is_sync:
@@ -376,9 +377,18 @@ class DNSResolver:
 
     # ---------- parsing helpers ----------
     @staticmethod
-    def _parse_dns_name(packet: bytes, offset: int, max_depth: int = 20) -> Tuple[str, int]:
+    def _parse_dns_name(packet: bytes, offset: int,
+                        max_depth: int = 20,
+                        _depth: int = 0) -> Tuple[str, int]:
+        """Parse a DNS name from wire format. Returns (name, new_offset).
+
+        Parameters:
+            packet: full DNS message bytes
+            offset: start of the name
+            max_depth: maximum pointer chain depth (to avoid loops)
+            _depth: current recursion depth (used internally)
+        """
         labels = []
-        depth = 0
         while True:
             if offset >= len(packet):
                 raise ValueError("Out of bounds while parsing DNS name")
@@ -392,10 +402,11 @@ class DNSResolver:
                 pointer = ((length & 0x3F) << 8) | packet[offset + 1]
                 if pointer >= len(packet):
                     raise ValueError("Pointer out of bounds")
-                depth += 1
-                if depth > max_depth:
+                if _depth >= max_depth:
                     raise ValueError("Pointer loop detected")
-                recursive_label, _ = DNSResolver._parse_dns_name(packet, pointer, max_depth)
+                recursive_label, _ = DNSResolver._parse_dns_name(
+                    packet, pointer, max_depth, _depth + 1
+                )
                 labels.append(recursive_label)
                 offset += 2
                 break
@@ -733,9 +744,11 @@ class DNSResolver:
                 ip = host_values[0]
                 try:
                     if _HAS_DNSPY:
+                        # Ensure absolute name for dnspython
+                        absolute_qname = qname if qname.endswith('.') else f"{qname}."
                         from dns import message, rdatatype, rdataclass, rrset
                         resp = dns.message.make_response(dns.message.from_wire(data) if data else None)
-                        rr = dns.rrset.from_text(str(qname), 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
+                        rr = dns.rrset.from_text(absolute_qname, 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
                         resp.answer = [rr]
                         return resp.to_wire()
                     else:
