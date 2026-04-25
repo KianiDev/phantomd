@@ -77,10 +77,13 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'rate_limit_rps': 0.0,
             'rate_limit_burst': 0.0,
             'upstreams': [],
-            # optimistic caching defaults
             'optimistic_cache_enabled': False,
             'optimistic_stale_max_age': 86400,
             'optimistic_stale_response_ttl': 30,
+            # DNS privilege dropping defaults (empty = disabled)
+            'dns_privilege_drop_user': '',
+            'dns_privilege_drop_group': '',
+            'dns_chroot_dir': '',
         }
     config.read(path)
 
@@ -172,6 +175,11 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     log_dir_owner: str = config.get('security', 'log_dir_owner', fallback='root:root')
     lease_db_owner: str = config.get('security', 'lease_db_owner', fallback='root:root')
 
+    # DNS-specific privilege dropping (new)
+    dns_privilege_drop_user: str = config.get('security', 'dns_privilege_drop_user', fallback='')
+    dns_privilege_drop_group: str = config.get('security', 'dns_privilege_drop_group', fallback='')
+    dns_chroot_dir: str = config.get('security', 'dns_chroot_dir', fallback='')
+
     # advanced tuning
     upstream_retries: int = config.getint('advanced', 'upstream_retries', fallback=2)
     upstream_initial_backoff: float = config.getfloat('advanced', 'upstream_initial_backoff', fallback=0.1)
@@ -180,8 +188,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     upstream_doh_timeout: float = config.getfloat('advanced', 'upstream_doh_timeout', fallback=5.0)
     rate_limit_rps: float = config.getfloat('advanced', 'rate_limit_rps', fallback=0.0)
     rate_limit_burst: float = config.getfloat('advanced', 'rate_limit_burst', fallback=0.0)
-
-    # NEW: optimistic cache options
     optimistic_cache_enabled: bool = config.getboolean('advanced', 'optimistic_cache_enabled', fallback=False)
     optimistic_stale_max_age: int = config.getint('advanced', 'optimistic_stale_max_age', fallback=86400)
     optimistic_stale_response_ttl: int = config.getint('advanced', 'optimistic_stale_response_ttl', fallback=30)
@@ -205,7 +211,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 except ValueError:
                     port = None
             else:
-                # default ports per protocol
                 if proto == 'tls':
                     port = 853
                 elif proto == 'https':
@@ -282,8 +287,11 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'rate_limit_rps': rate_limit_rps,
         'rate_limit_burst': rate_limit_burst,
         'upstreams': upstreams,
-        # optimistic caching
         'optimistic_cache_enabled': optimistic_cache_enabled,
         'optimistic_stale_max_age': optimistic_stale_max_age,
         'optimistic_stale_response_ttl': optimistic_stale_response_ttl,
+        # DNS privilege dropping
+        'dns_privilege_drop_user': dns_privilege_drop_user,
+        'dns_privilege_drop_group': dns_privilege_drop_group,
+        'dns_chroot_dir': dns_chroot_dir,
     }

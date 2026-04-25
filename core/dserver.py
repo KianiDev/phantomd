@@ -15,9 +15,7 @@ import dns.resolver
 
 
 class ResolverHolder:
-    """Mutable container that allows atomic resolver swaps.
-    UDP and TCP handlers read from this instead of holding a direct reference.
-    """
+    """Mutable container that allows atomic resolver swaps."""
     def __init__(self, resolver: DNSResolver) -> None:
         self.resolver: DNSResolver = resolver
 
@@ -38,10 +36,9 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
         asyncio.create_task(self._handle(data, addr))
 
     async def _handle(self, data: bytes, addr: Tuple[str, int]) -> None:
-        resolver = self.holder.resolver  # always read the latest resolver
+        resolver = self.holder.resolver
         client_ip = addr[0]
 
-        # --- Rate limiting ---
         if resolver.rate_limiter is not None:
             if not await resolver.rate_limiter.is_allowed(client_ip):
                 logging.debug("Rate‑limited UDP query from %s", client_ip)
@@ -59,7 +56,6 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
             except Exception:
                 qname = None
 
-            # Block AAAA queries when IPv6 is disabled
             if resolver.disable_ipv6 and qtype == dns.rdatatype.AAAA:
                 resp_wire = resolver.build_block_response(data, action='NXDOMAIN')
                 if self.transport:
@@ -71,7 +67,6 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                     pass
                 return
 
-            # Blocklist check
             if qname and resolver.is_blocked(qname):
                 action = resolver.get_block_action()
                 resp_wire = resolver.build_block_response(data, action=action)
@@ -84,10 +79,8 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                     pass
                 return
 
-            # Forward query to upstream
             response = await resolver.forward_dns_query(data)
 
-            # Strip AAAA records when IPv6 disabled
             if resolver.disable_ipv6:
                 try:
                     resp_msg = dns.message.from_wire(response)
@@ -113,10 +106,9 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     """Handle a single TCP DNS query."""
     peer = writer.get_extra_info('peername')
     logging.debug(f"Accepted TCP connection from {peer}")
-    resolver = holder.resolver  # always read the latest resolver
+    resolver = holder.resolver
     client_ip = peer[0] if peer else "unknown"
 
-    # --- Rate limiting ---
     if resolver.rate_limiter is not None:
         if not await resolver.rate_limiter.is_allowed(client_ip):
             logging.debug("Rate‑limited TCP query from %s", client_ip)
@@ -138,7 +130,6 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         except Exception:
             qname = None
 
-        # Block AAAA queries when IPv6 is disabled
         if resolver.disable_ipv6 and qtype == dns.rdatatype.AAAA:
             resp_wire = resolver.build_block_response(data, action='NXDOMAIN')
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
@@ -150,7 +141,6 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 pass
             return
 
-        # Blocklist check
         if qname and resolver.is_blocked(qname):
             action = resolver.get_block_action()
             resp_wire = resolver.build_block_response(data, action=action)
@@ -163,10 +153,8 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 pass
             return
 
-        # Forward query
         response = await resolver.forward_dns_query(data)
 
-        # Strip AAAA records when IPv6 disabled
         if resolver.disable_ipv6:
             try:
                 resp_msg = dns.message.from_wire(response)
@@ -217,7 +205,6 @@ async def reload_resolver(holder: ResolverHolder,
         rate_limit_rps=config.get("rate_limit_rps"),
         rate_limit_burst=config.get("rate_limit_burst"),
         upstreams=config.get("upstreams"),
-        # new optimistic cache options
         optimistic_cache_enabled=config.get("optimistic_cache_enabled"),
         optimistic_stale_max_age=config.get("optimistic_stale_max_age"),
         optimistic_stale_response_ttl=config.get("optimistic_stale_response_ttl"),
@@ -247,6 +234,38 @@ async def reload_resolver(holder: ResolverHolder,
                  current_resolver.upstream_dns, current_resolver.protocol)
 
 
+def _drop_dns_privileges(user: str, group: Optional[str] = None,
+                         chroot_dir: Optional[str] = None) -> None:
+    """Drop root privileges after binding DNS sockets."""
+    try:
+        if os.geteuid() != 0:
+            return
+    except Exception:
+        return
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(user)
+        gid = pw.pw_gid if group is None else grp.getgrnam(group).gr_gid
+        if chroot_dir:
+            try:
+                os.chroot(chroot_dir)
+                os.chdir('/')
+                logging.info('chroot to %s successful', chroot_dir)
+            except Exception as e:
+                logging.warning('chroot failed: %s', e)
+        try:
+            os.setgid(gid)
+            os.setuid(pw.pw_uid)
+            try:
+                os.setgroups([])
+            except Exception:
+                logging.debug('Failed to set supplementary groups during drop_privileges', exc_info=True)
+        except Exception as e:
+            logging.warning('Failed to drop privileges: %s', e)
+    except Exception as e:
+        logging.error('drop_privileges helper error: %s', e)
+
+
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
                      dns_resolver_server: Optional[str] = None,
                      verbose: bool = False,
@@ -274,7 +293,10 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      upstreams: Optional[List[Dict[str, Any]]] = None,
                      optimistic_cache_enabled: bool = False,
                      optimistic_stale_max_age: int = 86400,
-                     optimistic_stale_response_ttl: int = 30) -> None:
+                     optimistic_stale_response_ttl: int = 30,
+                     dns_privilege_drop_user: str = '',
+                     dns_privilege_drop_group: str = '',
+                     dns_chroot_dir: str = '') -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -301,13 +323,11 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         rate_limit_rps=rate_limit_rps,
         rate_limit_burst=rate_limit_burst,
         upstreams=upstreams,
-        # new optimistic cache options
         optimistic_cache_enabled=optimistic_cache_enabled,
         optimistic_stale_max_age=optimistic_stale_max_age,
         optimistic_stale_response_ttl=optimistic_stale_response_ttl,
     )
 
-    # Mutable holder for atomic resolver swaps
     holder = ResolverHolder(resolver)
     loop = asyncio.get_running_loop()
 
@@ -365,7 +385,14 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     )
     logging.info(f"DNS TCP listener running on {listen_ip}:{listen_port}")
 
-    # Store references so external code (e.g., main.py) can trigger reloads
+    # --- Privilege dropping after binding ---
+    if dns_privilege_drop_user:
+        _drop_dns_privileges(
+            user=dns_privilege_drop_user,
+            group=dns_privilege_drop_group or None,
+            chroot_dir=dns_chroot_dir or None
+        )
+
     run_server.holder = holder
     run_server.resolver = resolver
     run_server.blocklists = blocklists
