@@ -1,13 +1,24 @@
 # tests/test_phantomd_dhcp.py
 import pytest
+import asyncio
 import time
+import struct
+import socket
+from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
+
 from core.phantomd_dhcp import (
     ip_to_int, int_to_ip, calc_broadcast,
     DHCPServer, DHCPProtocol,
-    BOOTREPLY, DHCPOFFER, DHCPNAK, DHCPACK,
-    OPTION_MESSAGE_TYPE, OPTION_LEASE_TIME, OPTION_T1, OPTION_SERVER_ID
+    BOOTREPLY, DHCPOFFER, DHCPACK, DHCPNAK,
+    OPTION_MESSAGE_TYPE, OPTION_LEASE_TIME, OPTION_T1, OPTION_SERVER_ID,
+    OPTION_REQUESTED_IP, OPTION_PARAM_REQUEST_LIST, OPTION_END,
+    MAGIC_COOKIE, BOOTREQUEST, DHCPDISCOVER, DHCPREQUEST, DHCPRELEASE
 )
 
+
+# ---------------------------------------------------------------------------
+# Existing unit tests (kept exactly as before)
+# ---------------------------------------------------------------------------
 
 class TestIPConversion:
     def test_ip_to_int(self):
@@ -65,7 +76,7 @@ class TestPacketBuilding:
         nak = dhcp_server.build_nak(0x1234, b'\xaa\xbb\xcc\xdd\xee\xff')
         opts = dhcp_server.parse_options(nak[240:])
         assert opts[OPTION_MESSAGE_TYPE] == bytes([DHCPNAK])
-        assert opts[OPTION_SERVER_ID] == b'\xc0\xa8\x01\x01'  # 192.168.1.1
+        assert opts[OPTION_SERVER_ID] == socket.inet_aton('192.168.1.1')  # 192.168.1.1
 
 
 class TestLeaseAllocation:
@@ -95,7 +106,6 @@ class TestLeaseAllocation:
         assert ip == '192.168.1.200'
 
     def test_pool_exhausted(self, dhcp_server):
-        # single IP pool
         dhcp_server.start_ip = '192.168.1.100'
         dhcp_server.end_ip = '192.168.1.100'
         ip1 = dhcp_server.allocate_for_mac('11:22:33:44:55:66')
@@ -109,9 +119,7 @@ class TestLeaseAllocation:
         dhcp_server.ip_map['192.168.1.100'] = mac_old
         ip = dhcp_server.allocate_for_mac('aa:bb:cc:dd:ee:ff')
         assert ip == '192.168.1.100'
-        # old mac should be cleaned
         assert mac_old not in dhcp_server.leases
-
 
 
 class TestRateLimiting:
@@ -134,3 +142,217 @@ async def test_maintenance_cleanup_expired(dhcp_server):
         dhcp_server._cleanup_expired()
     assert mac not in dhcp_server.leases
     assert '192.168.1.105' not in dhcp_server.ip_map
+
+
+# ---------------------------------------------------------------------------
+# NEW: DHCPProtocol handler tests (datagram_received)
+# ---------------------------------------------------------------------------
+
+# Helper to build minimal DHCP packets for testing
+def _make_dhcp_packet(msg_type: int, xid: int = 0x12345678,
+                      chaddr: bytes = b'\xaa\xbb\xcc\xdd\xee\xff',
+                      requested_ip: str = None,
+                      server_id: str = None,
+                      ciaddr: str = '0.0.0.0',
+                      flags: int = 0,
+                      opts_extra: dict = None) -> bytes:
+    """Construct a raw DHCP packet with the given message type."""
+    # header
+    op = BOOTREQUEST
+    htype = 1
+    hlen = 6
+    hops = 0
+    secs = 0
+    ciaddr_b = socket.inet_aton(ciaddr)
+    yiaddr_b = b'\x00' * 4
+    siaddr_b = b'\x00' * 4
+    giaddr_b = b'\x00' * 4
+    ch = chaddr.ljust(16, b'\x00')[:16]
+    sname = b'\x00' * 64
+    filearea = b'\x00' * 128
+    header = struct.pack('>BBBBIHH4s4s4s4s16s64s128s',
+                         op, htype, hlen, hops, xid, secs, flags,
+                         ciaddr_b, yiaddr_b, siaddr_b, giaddr_b, ch, sname, filearea)
+    pkt = header + MAGIC_COOKIE
+    # options
+    opts = {}
+    opts[OPTION_MESSAGE_TYPE] = bytes([msg_type])
+    if requested_ip:
+        opts[OPTION_REQUESTED_IP] = socket.inet_aton(requested_ip)
+    if server_id:
+        opts[OPTION_SERVER_ID] = socket.inet_aton(server_id)
+    if opts_extra:
+        opts.update(opts_extra)
+    # build options blob
+    parts = bytearray()
+    for code, val in opts.items():
+        parts.append(code)
+        parts.append(len(val))
+        parts.extend(val)
+    parts.append(OPTION_END)
+    return pkt + bytes(parts)
+
+
+@pytest.fixture
+def dhcp_protocol():
+    """Return a DHCPProtocol instance with a fully mocked server."""
+    srv = MagicMock(spec=DHCPServer)
+    # Essential attributes and methods that datagram_received uses
+    srv._normalize_mac = DHCPServer._normalize_mac  # use real implementation
+    srv._allow_request = MagicMock(return_value=True)
+    srv.async_allocate_for_mac = AsyncMock(return_value='192.168.1.100')
+    srv.build_reply = MagicMock(return_value=b'\x02\x02' + b'\x00' * 300)  # dummy reply
+    srv.build_nak = MagicMock(return_value=b'\x03\x03' + b'\x00' * 300)
+    srv.build_options = DHCPServer.build_options  # real
+    srv.parse_options = DHCPServer.parse_options   # real
+    srv.broadcast_ip = '255.255.255.255'
+    srv.server_ip = '192.168.1.1'
+    srv.get_primary_ip = MagicMock(return_value='192.168.1.1')
+    srv.leases = {}   # needed for some checks
+    srv._save_leases = MagicMock()
+    srv._lock = asyncio.Lock()
+    srv._offered = {}
+    srv.static_leases = {}
+    srv._conflicted_ips = {}
+    srv.lease_ttl = 600
+    srv.netmask = '255.255.255.0'
+    srv.subnet = '192.168.1.0'
+    srv.arp_probe_enable = False
+    # Mock the _send_packet indirectly through transport
+    proto = DHCPProtocol(srv)
+    return proto
+
+
+@pytest.mark.asyncio
+async def test_discover_sends_offer(dhcp_protocol):
+    """A valid DHCPDISCOVER triggers an offer via _send_packet."""
+    pkt = _make_dhcp_packet(DHCPDISCOVER, xid=0xAABB)
+    transport = MagicMock()
+    transport.get_extra_info = MagicMock(return_value=None)  # no socket
+    transport.sendto = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.5', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    # Wait for the created handler task to run
+    await asyncio.sleep(0.01)
+
+    # The server should have called build_reply with OFFER
+    dhcp_protocol.server.build_reply.assert_called_once()
+    # The reply should have been sent via sendto (broadcast)
+    transport.sendto.assert_called()
+    # Check that the sent data starts with the dummy offer bytes
+    sent_data = transport.sendto.call_args[0][0]
+    assert sent_data[:2] == b'\x02\x02'  # our mocked reply
+
+@pytest.mark.asyncio
+async def test_request_sends_ack(dhcp_protocol):
+    """A valid DHCPREQUEST returns an ACK."""
+    pkt = _make_dhcp_packet(DHCPREQUEST, xid=0xBEEF,
+                            requested_ip='192.168.1.110',
+                            server_id='192.168.1.1')
+    transport = MagicMock()
+    transport.get_extra_info = MagicMock(return_value=None)
+    transport.sendto = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.6', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    dhcp_protocol.server.async_handle_request.assert_called_once()
+    # build_reply for ACK should have been called (the mock always returns that)
+    dhcp_protocol.server.build_reply.assert_called_once()
+    transport.sendto.assert_called()
+
+@pytest.mark.asyncio
+async def test_request_wrong_server_id_ignored(dhcp_protocol):
+    """A REQUEST with a mismatched server ID is dropped silently."""
+    pkt = _make_dhcp_packet(DHCPREQUEST, xid=0xBEEF,
+                            requested_ip='192.168.1.110',
+                            server_id='1.2.3.4')
+    transport = MagicMock()
+    transport.get_extra_info = MagicMock(return_value=None)
+    transport.sendto = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.7', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    # No send should happen because the REQUEST is ignored
+    dhcp_protocol.server.async_handle_request.assert_not_called()
+    transport.sendto.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_release_removes_lease(dhcp_protocol):
+    """A RELEASE removes the client's lease."""
+    # First, manually insert a lease in the server mock
+    dhcp_protocol.server.leases['aa:bb:cc:dd:ee:ff'] = {'ip': '192.168.1.150', 'expiry': time.time() + 600}
+    dhcp_protocol.server.ip_map = {'192.168.1.150': 'aa:bb:cc:dd:ee:ff'}
+    pkt = _make_dhcp_packet(DHCPRELEASE, xid=0xDEAD, ciaddr='192.168.1.150')
+    transport = MagicMock()
+    transport.get_extra_info = MagicMock(return_value=None)
+    transport.sendto = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.8', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    # Lease should be gone
+    assert 'aa:bb:cc:dd:ee:ff' not in dhcp_protocol.server.leases
+
+@pytest.mark.asyncio
+async def test_rate_limited_packet_dropped(dhcp_protocol):
+    """If _allow_request returns False, the packet is dropped."""
+    dhcp_protocol.server._allow_request.return_value = False
+    pkt = _make_dhcp_packet(DHCPDISCOVER)
+    transport = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.9', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    transport.sendto.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_invalid_mac_dropped(dhcp_protocol):
+    """Packet with an invalid MAC is dropped."""
+    # Modify _normalize_mac to return None for this call
+    original = dhcp_protocol.server._normalize_mac
+    dhcp_protocol.server._normalize_mac = MagicMock(return_value=None)
+    pkt = _make_dhcp_packet(DHCPDISCOVER, chaddr=b'\x00' * 6)  # invalid
+    transport = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.10', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    transport.sendto.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_short_packet_ignored(dhcp_protocol):
+    """Less than 240 bytes → ignored."""
+    transport = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    dhcp_protocol.datagram_received(b'\x00' * 100, ('10.0.0.11', 68))
+    await asyncio.sleep(0.01)
+    transport.sendto.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_discover_no_ip_available(dhcp_protocol):
+    """If no IP is available, no offer is sent (silently)."""
+    dhcp_protocol.server.async_allocate_for_mac.return_value = None
+    pkt = _make_dhcp_packet(DHCPDISCOVER)
+    transport = MagicMock()
+    dhcp_protocol.connection_made(transport)
+    addr = ('10.0.0.12', 68)
+
+    dhcp_protocol.datagram_received(pkt, addr)
+    await asyncio.sleep(0.01)
+
+    # No offer packet should be sent
+    transport.sendto.assert_not_called()
