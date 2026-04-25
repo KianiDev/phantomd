@@ -22,6 +22,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Debug - list test directory
+      run: |
+        echo "Contents of tests/:"
+        ls -la tests/
+        echo
+        echo "Python files:"
+        find tests/ -name "*.py" -type f
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
