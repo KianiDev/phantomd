@@ -2,15 +2,27 @@
 set -eu
 
 # Fetches repository tarball, sets up virtualenv, installs deps, creates systemd service,
-# and writes config/phantomd.conf interactively
+# and writes config/phantomd.conf interactively.
+#
+# Usage:
+#   ./installer.sh            # fresh install (interactive)
+#   ./installer.sh --update   # update an existing installation (non‑interactive, keeps config)
 
 VERSION="1.2.0"
 REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
 INSTALL_DIR="/opt/phantomd"
 VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_NAME="phantomd"
+CONFIG_FILE="$INSTALL_DIR/config/phantomd.conf"
 
-echo "phantomd installer (version $VERSION, headless)"
+# ---------- Argument parsing ----------
+FRESH_INSTALL=true
+if [ "${1:-}" = "--update" ]; then
+    FRESH_INSTALL=false
+    echo "Running in update mode – your configuration will not be changed."
+fi
+
+echo "phantomd installer (version $VERSION)"
 
 # ensure running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -18,6 +30,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# ---------- Fetch and extract ----------
 mkdir -p "$INSTALL_DIR"
 chown root:root "$INSTALL_DIR"
 
@@ -34,10 +47,20 @@ if [ ! -d "$EXTRACTED_DIR" ]; then
   exit 1
 fi
 
-cp -a "$EXTRACTED_DIR"/* "$INSTALL_DIR/"
+# Copy over new files but **never** overwrite the existing config file.
+# We use rsync style: copy all except config.
+for item in "$EXTRACTED_DIR"/*; do
+    base=$(basename "$item")
+    if [ "$base" = "config" ]; then
+        # Existing config directory is preserved entirely (we only add the template
+        # if no config file exists – handled later).
+        continue
+    fi
+    cp -a "$item" "$INSTALL_DIR/"
+done
 rm -f "$TMP_TAR"
 
-# create venv
+# ---------- Python virtualenv ----------
 if [ ! -x "$(command -v python3)" ]; then
   echo "python3 not found. Please install python3."; exit 1
 fi
@@ -45,8 +68,6 @@ python3 -m venv "$VENV_DIR"
 . "$VENV_DIR/bin/activate"
 
 echo "Upgrading pip and installing runtime dependencies from requirements.txt..."
-# Best-effort install runtime dependencies only. Development/test deps are intentionally
-# not included in requirements.txt and should be installed by developers in their envs.
 pip install --upgrade pip
 if [ -f "$INSTALL_DIR/requirements.txt" ]; then
   pip install -r "$INSTALL_DIR/requirements.txt" || true
@@ -55,12 +76,11 @@ else
   pip install httpx aiohttp dnspython requests cachetools aiosqlite cryptography prometheus_client uvloop || true
 fi
 
-# try to install some OS-level helper packages if apt is available
+# ---------- OS helpers ----------
 if command -v apt-get >/dev/null 2>&1; then
   echo "Installing minimal runtime packages via apt-get..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y || true
-  # Install only minimal runtime helpers. Do not install heavy build toolchains here.
   apt-get install -y --no-install-recommends \
     python3-venv \
     python3-dev \
@@ -68,7 +88,6 @@ if command -v apt-get >/dev/null 2>&1; then
     curl \
     iputils-arping \
     libcap2-bin || true
-  # update CA certs if available
   if command -v update-ca-certificates >/dev/null 2>&1; then
     update-ca-certificates || true
   fi
@@ -76,14 +95,13 @@ if command -v apt-get >/dev/null 2>&1; then
   echo "install build-essential, libssl-dev, rustc and cargo separately before running pip."
 fi
 
-# create logs directory
+# ---------- Directories ----------
 mkdir -p /var/log/phantomd
 chown root:root /var/log/phantomd
-# create var lib directory for leases
 mkdir -p /var/lib/phantomd
 chown root:root /var/lib/phantomd
 
-# Create systemd service
+# ---------- Systemd service ----------
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
@@ -108,13 +126,12 @@ EOF
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" || true
 
-# Interactive config generation (headless prompts)
-CONFIG_FILE="$INSTALL_DIR/config/phantomd.conf"
-# Ensure the config directory exists
+# ---------- Configuration ----------
 mkdir -p "$(dirname "$CONFIG_FILE")"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-  cat > "$CONFIG_FILE" <<'EOF'
+if [ "$FRESH_INSTALL" = true ]; then
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" <<'EOF'
 [upstream]
 dns_server = 1.1.1.1
 dns_protocol = udp # Supported: udp, tcp, tls, https, quic
@@ -155,42 +172,47 @@ static_leases =
 # Path to lease DB file
 dhcp_lease_db = /var/lib/phantomd/dhcp_leases.json
 EOF
+    fi
+
+    echo "Configuration template written to $CONFIG_FILE"
+
+    # Utility function to safely escape a value for use in a sed substitution
+    escape_sed() {
+      printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+    }
+
+    # Guide user through options
+    echo "Configuring phantomd. Press ENTER to accept the shown default in []"
+    read -r -p "Upstream DNS (ip or host) [1.1.1.1]: " INPUT; INPUT=${INPUT:-1.1.1.1}
+    INPUT_ESC="$(escape_sed "$INPUT")"
+    sed -i "s/^dns_server =.*$/dns_server = $INPUT_ESC/" "$CONFIG_FILE"
+
+    read -r -p "Upstream protocol (udp/tcp/tls/https/quic) [udp]: " INPUT; INPUT=${INPUT:-udp}
+    INPUT_ESC="$(escape_sed "$INPUT")"
+    sed -i "s/^dns_protocol =.*$/dns_protocol = $INPUT_ESC/" "$CONFIG_FILE"
+
+    read -r -p "Enable blocklists? (true/false) [false]: " INPUT; INPUT=${INPUT:-false}
+    INPUT_ESC="$(escape_sed "$INPUT")"
+    sed -i "s/^enabled =.*$/enabled = $INPUT_ESC/" "$CONFIG_FILE"
+    if [ "$INPUT" = "true" ]; then
+      read -r -p "Blocklist URLs (comma-separated) []: " INPUT2
+      INPUT2_ESC="$(escape_sed "$INPUT2")"
+      sed -i "s/^urls =.*$/urls = $INPUT2_ESC/" "$CONFIG_FILE"
+      read -r -p "Block action (ZEROIP/NXDOMAIN/REFUSED) [NXDOMAIN]: " INPUT3; INPUT3=${INPUT3:-NXDOMAIN}
+      INPUT3_ESC="$(escape_sed "$INPUT3")"
+      sed -i "s/^action =.*$/action = $INPUT3_ESC/" "$CONFIG_FILE"
+    fi
+else
+    echo "Update mode – existing configuration in $CONFIG_FILE was left untouched."
 fi
 
-echo "Configuration template written to $CONFIG_FILE"
-
-# Utility function to safely escape a value for use in a sed substitution
-# (escapes '/' and '&')
-escape_sed() {
-  printf '%s' "$1" | sed 's/[\/&]/\\&/g'
-}
-
-# Guide user through options
-echo "Configuring phantomd. Press ENTER to accept the shown default in []"
-read -r -p "Upstream DNS (ip or host) [1.1.1.1]: " INPUT; INPUT=${INPUT:-1.1.1.1}
-INPUT_ESC="$(escape_sed "$INPUT")"
-sed -i "s/^dns_server =.*$/dns_server = $INPUT_ESC/" "$CONFIG_FILE"
-
-read -r -p "Upstream protocol (udp/tcp/tls/https/quic) [udp]: " INPUT; INPUT=${INPUT:-udp}
-INPUT_ESC="$(escape_sed "$INPUT")"
-sed -i "s/^dns_protocol =.*$/dns_protocol = $INPUT_ESC/" "$CONFIG_FILE"
-
-read -r -p "Enable blocklists? (true/false) [false]: " INPUT; INPUT=${INPUT:-false}
-INPUT_ESC="$(escape_sed "$INPUT")"
-sed -i "s/^enabled =.*$/enabled = $INPUT_ESC/" "$CONFIG_FILE"
-if [ "$INPUT" = "true" ]; then
-  read -r -p "Blocklist URLs (comma-separated) []: " INPUT2
-  INPUT2_ESC="$(escape_sed "$INPUT2")"
-  sed -i "s/^urls =.*$/urls = $INPUT2_ESC/" "$CONFIG_FILE"
-  read -r -p "Block action (ZEROIP/NXDOMAIN/REFUSED) [NXDOMAIN]: " INPUT3; INPUT3=${INPUT3:-NXDOMAIN}
-  INPUT3_ESC="$(escape_sed "$INPUT3")"
-  sed -i "s/^action =.*$/action = $INPUT3_ESC/" "$CONFIG_FILE"
+echo ""
+echo "Installation complete."
+if [ "$FRESH_INSTALL" = true ]; then
+    echo "Start the service with: sudo systemctl start phantomd"
+else
+    echo "Restart the service to apply changes: sudo systemctl restart phantomd"
 fi
-
-# Skip interactive DHCP, logging and other prompts; defaults from template will be used.
-
-echo "Installation complete. Start the service with: sudo systemctl start phantomd"
-
 echo "You can view logs with: sudo journalctl -u phantomd -f"
 
 exit 0
