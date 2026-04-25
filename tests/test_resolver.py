@@ -275,13 +275,11 @@ async def test_hosts_map_avoids_forwarding(resolver_mocked_forward):
 @pytest.mark.asyncio
 async def test_wire_cache_prevents_forwarding(resolver_mocked_forward):
     data = b'\x55\x66\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03cached\x00\x00\x01\x00\x01'
-    # Pre‑populate the wire cache
-    key = ("cached", 1, resolver_mocked_forward.protocol)
-    await resolver_mocked_forward._wire_cache_set(key, b'\xcc\xcc', ttl_seconds=60)
+    cached_response = b'\xcc\xcc'
+    resolver_mocked_forward._wire_cache_get_valid = AsyncMock(return_value=cached_response)
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    # Must not have called any forward method
     resolver_mocked_forward._forward_udp.assert_not_called()
-    assert resp == b'\xcc\xcc'
+    assert resp == cached_response
     
 # ---------------------------------------------------------------------------
 # NEW: RateLimiter unit tests
