@@ -76,7 +76,11 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'upstream_doh_timeout': 5.0,
             'rate_limit_rps': 0.0,
             'rate_limit_burst': 0.0,
-            'upstreams': [],     # new: list of upstream server configs
+            'upstreams': [],
+            # optimistic caching defaults
+            'optimistic_cache_enabled': False,
+            'optimistic_stale_max_age': 86400,
+            'optimistic_stale_response_ttl': 30,
         }
     config.read(path)
 
@@ -177,7 +181,12 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     rate_limit_rps: float = config.getfloat('advanced', 'rate_limit_rps', fallback=0.0)
     rate_limit_burst: float = config.getfloat('advanced', 'rate_limit_burst', fallback=0.0)
 
-    # --- NEW: Multi-upstream parsing ---
+    # NEW: optimistic cache options
+    optimistic_cache_enabled: bool = config.getboolean('advanced', 'optimistic_cache_enabled', fallback=False)
+    optimistic_stale_max_age: int = config.getint('advanced', 'optimistic_stale_max_age', fallback=86400)
+    optimistic_stale_response_ttl: int = config.getint('advanced', 'optimistic_stale_response_ttl', fallback=30)
+
+    # --- Multi-upstream parsing ---
     upstreams: List[Dict[str, Any]] = []
     if config.has_section('upstreams') and config.has_option('upstreams', 'servers'):
         server_names = [s.strip() for s in config.get('upstreams', 'servers').split(',') if s.strip()]
@@ -272,5 +281,9 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'upstream_doh_timeout': upstream_doh_timeout,
         'rate_limit_rps': rate_limit_rps,
         'rate_limit_burst': rate_limit_burst,
-        'upstreams': upstreams,  # new: list of upstream dicts
+        'upstreams': upstreams,
+        # optimistic caching
+        'optimistic_cache_enabled': optimistic_cache_enabled,
+        'optimistic_stale_max_age': optimistic_stale_max_age,
+        'optimistic_stale_response_ttl': optimistic_stale_response_ttl,
     }

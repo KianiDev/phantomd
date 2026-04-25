@@ -216,7 +216,11 @@ async def reload_resolver(holder: ResolverHolder,
         metrics_port=config.get("metrics_port", 8000),
         rate_limit_rps=config.get("rate_limit_rps"),
         rate_limit_burst=config.get("rate_limit_burst"),
-        upstreams=config.get("upstreams"),  # NEW: multi-upstream list
+        upstreams=config.get("upstreams"),
+        # new optimistic cache options
+        optimistic_cache_enabled=config.get("optimistic_cache_enabled"),
+        optimistic_stale_max_age=config.get("optimistic_stale_max_age"),
+        optimistic_stale_response_ttl=config.get("optimistic_stale_response_ttl"),
     )
 
     if blocklists:
@@ -267,7 +271,10 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      upstream_doh_timeout: float = 5.0,
                      rate_limit_rps: float = 0.0,
                      rate_limit_burst: float = 0.0,
-                     upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
+                     upstreams: Optional[List[Dict[str, Any]]] = None,
+                     optimistic_cache_enabled: bool = False,
+                     optimistic_stale_max_age: int = 86400,
+                     optimistic_stale_response_ttl: int = 30) -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -293,7 +300,11 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         uvloop_enable=uvloop_enable,
         rate_limit_rps=rate_limit_rps,
         rate_limit_burst=rate_limit_burst,
-        upstreams=upstreams,  # NEW: multi-upstream list
+        upstreams=upstreams,
+        # new optimistic cache options
+        optimistic_cache_enabled=optimistic_cache_enabled,
+        optimistic_stale_max_age=optimistic_stale_max_age,
+        optimistic_stale_response_ttl=optimistic_stale_response_ttl,
     )
 
     # Mutable holder for atomic resolver swaps

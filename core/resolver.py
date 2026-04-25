@@ -100,7 +100,6 @@ class RateLimiter:
         self._lock: asyncio.Lock = asyncio.Lock()
 
     async def is_allowed(self, key: str) -> bool:
-        """Check whether a request identified by `key` (e.g., client IP) is allowed under the rate limit."""
         async with self._lock:
             now = time.time()
             tokens, last = self._buckets.get(key, (self.burst, now))
@@ -123,6 +122,7 @@ class DNSResolver:
       - Optional Prometheus metrics and uvloop enable
       - Integrated rate limiter (per client IP)
       - Multi-upstream with automatic failover (configurable upstream list)
+      - Optimistic caching (serve-stale per RFC 8767)
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -151,7 +151,10 @@ class DNSResolver:
                   uvloop_enable: bool = False,
                   rate_limit_rps: float = 0.0,
                   rate_limit_burst: float = 0.0,
-                  upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
+                  upstreams: Optional[List[Dict[str, Any]]] = None,
+                  optimistic_cache_enabled: bool = False,
+                  optimistic_stale_max_age: int = 86400,
+                  optimistic_stale_response_ttl: int = 30) -> None:
         # --- single upstream fallback ---
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
@@ -251,6 +254,14 @@ class DNSResolver:
         else:
             self.rate_limiter = None
 
+        # --- Optimistic caching ---
+        self.optimistic_cache_enabled: bool = optimistic_cache_enabled
+        self.stale_max_age: int = optimistic_stale_max_age
+        self.stale_response_ttl: int = optimistic_stale_response_ttl
+        # set of in-flight keys to avoid duplicate refresh tasks
+        self._stale_refresh_pending: Set[str] = set()
+        self._stale_refresh_lock: asyncio.Lock = asyncio.Lock()
+
     # ---------- blocklist helpers ----------
     def set_blocklist(self, domains: Iterable[str]) -> None:
         """Replace blocklist. domains is an iterable of domain strings.
@@ -330,8 +341,9 @@ class DNSResolver:
                 return True
         return False
 
-    # ---------- wire-cache helpers ----------
-    async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[bytes]:
+    # ---------- wire-cache helpers (extended for optimistic caching) ----------
+    async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, float, bytes, float]]:
+        """Return the full cache entry or None."""
         try:
             async with self._lock:
                 if self._cache_is_sync:
@@ -342,51 +354,150 @@ class DNSResolver:
             self.logger.debug("wire cache get error %s: %s", key, e)
             return None
 
-    async def _wire_cache_set(self, key: Tuple[str, int, str], response_bytes: bytes, ttl_seconds: int) -> None:
+    async def _wire_cache_set(self, key: Tuple[str, int, str], response_bytes: bytes,
+                              ttl_seconds: int, query_data: bytes) -> None:
+        """Store wire response with per-entry TTL and optional stale support."""
         try:
-            # Use the TTL directly, allowing zero for immediate expiry
             expiry = time.time() + max(0, int(ttl_seconds or 0))
-            val = (response_bytes, expiry)
+            stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+            val = (response_bytes, expiry, query_data, stale_until)
             async with self._lock:
                 if self._cache_is_sync:
                     self._wire_cache[key] = val  # type: ignore[index]
                 else:
                     await self._wire_cache.set(key, val)  # type: ignore[attr-defined]
-            self.logger.debug("wire cache set %s ttl=%s", key, ttl_seconds)
+            self.logger.debug("wire cache set %s ttl=%s stale_until=%s", key, ttl_seconds, stale_until)
         except Exception as e:
             self.logger.debug("wire cache set error %s: %s", key, e)
 
     async def _wire_cache_get_valid(self, key: Tuple[str, int, str]) -> Optional[bytes]:
+        """Return fresh or stale response bytes, or None. Triggers background refresh for stale."""
         try:
             async with self._lock:
-                if self._cache_is_sync:
-                    raw = self._wire_cache.get(key)  # type: ignore[attr-defined]
-                else:
-                    raw = await self._wire_cache.get(key)  # type: ignore[attr-defined]
-                if raw is None:
+                entry = await self._wire_cache_get(key) if not self._cache_is_sync else self._wire_cache.get(key)
+                if entry is None:
                     return None
-                if isinstance(raw, tuple):
-                    resp, expiry = raw
-                    if time.time() >= expiry:
-                        try:
-                            if self._cache_is_sync:
-                                del self._wire_cache[key]  # type: ignore[attr-defined]
-                            else:
-                                await self._wire_cache.delete(key)  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                        return None
-                    return resp
-                return raw
+
+                # Handle older format (just bytes) for backward compatibility
+                if isinstance(entry, bytes):
+                    return entry
+
+                # Expected format: (response_bytes, expiry, query_data, stale_until)
+                if isinstance(entry, tuple) and len(entry) == 4:
+                    resp_bytes, expiry, query_data, stale_until = entry
+                    now = time.time()
+                    if now < expiry:
+                        # still fresh
+                        return resp_bytes
+                    # expired – check if stale serving is enabled and allowed
+                    if self.optimistic_cache_enabled and now < stale_until:
+                        # serve stale and trigger background refresh
+                        self.logger.debug("serving stale response for %s (age=%.1fs)", key, now - expiry)
+                        # Modify TTL in the response to short value
+                        stale_resp = self._set_response_ttl(resp_bytes, self.stale_response_ttl)
+                        # Fire off background refresh if not already pending
+                        await self._maybe_refresh_stale(key, query_data)
+                        return stale_resp
+                    # truly expired – delete
+                    if self._cache_is_sync:
+                        del self._wire_cache[key]  # type: ignore[attr-defined]
+                    else:
+                        await self._wire_cache.delete(key)  # type: ignore[attr-defined]
+                    return None
+
+                # If it's an older tuple format without query_data/stale_until, treat as expired
+                return None
         except Exception:
             return None
+
+    async def _maybe_refresh_stale(self, key: Tuple[str, int, str], query_data: bytes) -> None:
+        """Schedule a background refresh if not already in progress."""
+        async with self._stale_refresh_lock:
+            if key in self._stale_refresh_pending:
+                return
+            self._stale_refresh_pending.add(key)
+        asyncio.create_task(self._background_refresh(key, query_data))
+
+    async def _background_refresh(self, key: Tuple[str, int, str], query_data: bytes) -> None:
+        """Fetch a fresh response from upstream and update the cache."""
+        try:
+            upstream_list = self.upstreams if self.upstreams else [
+                {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
+            ]
+            last_exc = None
+            for upstream in upstream_list:
+                try:
+                    resp = await self._try_upstream(upstream, query_data)
+                    if self.dnssec_enabled:
+                        qname = key[0] if key[0] else None
+                        if qname:
+                            try:
+                                await self._dnssec_validate(qname, resp)
+                            except Exception as e:
+                                self.logger.warning("DNSSEC validation failed for stale refresh %s: %s", key, e)
+                                # continue to next upstream
+                                continue
+                    ttl = self._extract_min_ttl(resp)
+                    if ttl <= 0:
+                        ttl = 30
+                    await self._wire_cache_set(key, resp, ttl, query_data)
+                    self.logger.debug("stale refresh succeeded for %s from %s", key, upstream['address'])
+                    return
+                except Exception as e:
+                    last_exc = e
+                    self.logger.debug("stale refresh upstream %s failed: %s", upstream['address'], e)
+            self.logger.warning("stale refresh failed for %s: %s", key, last_exc)
+        finally:
+            async with self._stale_refresh_lock:
+                self._stale_refresh_pending.discard(key)
+
+    def _set_response_ttl(self, response_bytes: bytes, ttl: int) -> bytes:
+        """Return a copy of the response where every resource record TTL is set to `ttl`."""
+        if not _HAS_DNSPY:
+            return response_bytes
+        try:
+            old_msg = dns.message.from_wire(response_bytes)
+            new_msg = dns.message.Message()
+            new_msg.id = old_msg.id
+            new_msg.flags = old_msg.flags
+
+            # Copy question section unchanged
+            for q in old_msg.question:
+                new_msg.question.append(q)
+
+            # Helper to rebuild a list of rrsets with a different TTL
+            def _rebuild_section(rrsets):
+                new_list = []
+                for rrset in rrsets:
+                    # Create a new, empty rrset of the same type, class, and name
+                    new_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                    new_rrset.ttl = ttl
+                    for rd in rrset:
+                        # Get the original rdata as wire bytes
+                        rd_wire = rd.to_wire()
+                        # Re‑create a fresh rdata object so no cached wire remains
+                        new_rd = dns.rdata.from_wire(
+                            rrset.rdclass, rrset.rdtype, rd_wire, 0, len(rd_wire)
+                        )
+                        new_rrset.add(new_rd)
+                    new_list.append(new_rrset)
+                return new_list
+
+            new_msg.answer = _rebuild_section(old_msg.answer)
+            new_msg.authority = _rebuild_section(old_msg.authority)
+            new_msg.additional = _rebuild_section(old_msg.additional)
+
+            return new_msg.to_wire()
+        except Exception as e:
+            # If anything fails, log and fall back to the original response
+            self.logger.debug("_set_response_ttl failed: %s", e)
+            return response_bytes
 
     # ---------- parsing helpers ----------
     @staticmethod
     def _parse_dns_name(packet: bytes, offset: int,
                         max_depth: int = 20,
                         _depth: int = 0) -> Tuple[str, int]:
-        """Parse a DNS name from wire format. Returns (name, new_offset)."""
         labels = []
         while True:
             if offset >= len(packet):
@@ -815,7 +926,7 @@ class DNSResolver:
                 ttl = self._extract_min_ttl(resp)
                 if ttl <= 0:
                     ttl = 30
-                await self._wire_cache_set(key, resp, ttl)
+                await self._wire_cache_set(key, resp, ttl, data)   # pass query_data for stale support
                 return resp
             except Exception as e:
                 last_exc = e
@@ -1419,7 +1530,10 @@ class DNSResolver:
                       uvloop_enable: Optional[bool] = None,
                       rate_limit_rps: Optional[float] = None,
                       rate_limit_burst: Optional[float] = None,
-                      upstreams: Optional[List[Dict[str, Any]]] = None) -> None:
+                      upstreams: Optional[List[Dict[str, Any]]] = None,
+                      optimistic_cache_enabled: Optional[bool] = None,
+                      optimistic_stale_max_age: Optional[int] = None,
+                      optimistic_stale_response_ttl: Optional[int] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -1472,9 +1586,17 @@ class DNSResolver:
         # Upstream list update
         if upstreams is not None:
             self.upstreams = upstreams
+        # Optimistic cache settings
+        if optimistic_cache_enabled is not None:
+            self.optimistic_cache_enabled = optimistic_cache_enabled
+        if optimistic_stale_max_age is not None:
+            self.stale_max_age = optimistic_stale_max_age
+        if optimistic_stale_response_ttl is not None:
+            self.stale_response_ttl = optimistic_stale_response_ttl
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
-                         "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s",
+                         "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s",
                          self.upstream_dns, self.protocol,
                          self.disable_ipv6, self.verbose,
-                         self.rate_limit_rps, self.rate_limit_burst)
+                         self.rate_limit_rps, self.rate_limit_burst,
+                         self.optimistic_cache_enabled)

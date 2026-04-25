@@ -78,10 +78,14 @@ def main() -> None:
     upstream_udp_timeout_val: float = float(config.get("upstream_udp_timeout", 2.0))
     upstream_tcp_timeout_val: float = float(config.get("upstream_tcp_timeout", 5.0))
     upstream_doh_timeout_val: float = float(config.get("upstream_doh_timeout", 5.0))
-
-    # NEW: DNS rate‑limiting values
     rate_limit_rps_val: float = float(config.get("rate_limit_rps", 0.0))
     rate_limit_burst_val: float = float(config.get("rate_limit_burst", 0.0))
+    # Multi-upstream list
+    upstreams_val: List[Dict[str, Any]] = config.get("upstreams", [])
+    # Optimistic caching
+    optimistic_cache_enabled_val: bool = bool(config.get("optimistic_cache_enabled", False))
+    optimistic_stale_max_age_val: int = int(config.get("optimistic_stale_max_age", 86400))
+    optimistic_stale_response_ttl_val: int = int(config.get("optimistic_stale_response_ttl", 30))
 
     # DHCP configuration
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
@@ -223,6 +227,10 @@ def main() -> None:
             upstream_doh_timeout=upstream_doh_timeout_val,
             rate_limit_rps=rate_limit_rps_val,
             rate_limit_burst=rate_limit_burst_val,
+            upstreams=upstreams_val,
+            optimistic_cache_enabled=optimistic_cache_enabled_val,
+            optimistic_stale_max_age=optimistic_stale_max_age_val,
+            optimistic_stale_response_ttl=optimistic_stale_response_ttl_val,
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None

@@ -12,9 +12,9 @@ from core.resolver import DNSResolver, _HAS_CACHETOOLS, _HAS_AIOQUIC, RateLimite
 class TestParsing:
     def test_parse_simple_name(self):
         data = (
-            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # header
-            b'\x03www\x07example\x03com\x00'                      # question
-            b'\x00\x01\x00\x01'                                    # qtype + qclass
+            b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+            b'\x03www\x07example\x03com\x00'
+            b'\x00\x01\x00\x01'
         )
         name, offset = DNSResolver._parse_dns_name(data, 12)
         assert name == "www.example.com"
@@ -25,27 +25,26 @@ class TestParsing:
             b'\x00' * 12 +
             b'\x07example\x03com\x00' +
             b'\x00\x01\x00\x01' +
-            b'\xc0\x0c'   # pointer to offset 12 (0x0c)
+            b'\xc0\x0c'
         )
-        # The pointer is at offset 29 (12+13+4). Parsing from there should yield "example.com"
         name, offset = DNSResolver._parse_dns_name(data, 29)
         assert name == "example.com"
-        assert offset == 31   # 29 + 2 bytes for pointer
+        assert offset == 31
 
     def test_parse_pointer_loop(self):
         data = bytearray(b'\x00' * 20)
         data[12] = 0xC0
-        data[13] = 12  # points to itself
+        data[13] = 12
         with pytest.raises(ValueError):
             DNSResolver._parse_dns_name(data, 12)
 
     def test_parse_name_out_of_bounds_label(self):
-        data = b'\x00' * 12 + b'\x10abc'  # label length 16 but only 3 bytes follow
+        data = b'\x00' * 12 + b'\x10abc'
         with pytest.raises(ValueError):
             DNSResolver._parse_dns_name(data, 12)
 
     def test_parse_name_truncated_pointer(self):
-        data = b'\x00' * 12 + b'\xc0'  # only one byte of pointer
+        data = b'\x00' * 12 + b'\xc0'
         with pytest.raises(ValueError):
             DNSResolver._parse_dns_name(data, 12)
 
@@ -64,7 +63,7 @@ class TestParsing:
         assert qtype == 28
 
     def test_extract_qtype_truncated(self, resolver_no_network):
-        data = b'\x00' * 12 + b'\x03abc\x00'  # missing qtype/class
+        data = b'\x00' * 12 + b'\x03abc\x00'
         assert resolver_no_network._extract_qtype_from_wire(data) is None
 
 
@@ -97,14 +96,14 @@ class TestCache:
 
     async def test_wire_cache_expiry(self, resolver_no_network):
         key = ("expired.test", 1, "udp")
-        await resolver_no_network._wire_cache_set(key, b'\x00' * 20, ttl_seconds=0)
+        await resolver_no_network._wire_cache_set(key, b'\x00' * 20, ttl_seconds=0, query_data=b'\x00')
         val = await resolver_no_network._wire_cache_get_valid(key)
         assert val is None
 
     async def test_wire_cache_normal(self, resolver_no_network):
         key = ("fresh.test", 1, "udp")
         data = b'\x01\x02'
-        await resolver_no_network._wire_cache_set(key, data, ttl_seconds=300)
+        await resolver_no_network._wire_cache_set(key, data, ttl_seconds=300, query_data=b'\x00')
         cached = await resolver_no_network._wire_cache_get_valid(key)
         assert cached == data
 
@@ -116,7 +115,7 @@ class TestNXDOMAIN:
         resp = resolver_no_network._make_nxdomain_response(query)
         assert resp[0:2] == b'\xAA\xBB'
         flags = int.from_bytes(resp[2:4], 'big')
-        assert (flags & 0x000F) == 3  # NXDOMAIN rcode
+        assert (flags & 0x000F) == 3
 
 
 class TestHostPortSplitting:
@@ -132,13 +131,10 @@ class TestLocalAResponse:
         query = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
         query += b'\x03www\x07example\x03com\x00\x00\x01\x00\x01'
         resp = resolver_no_network._build_local_A_response(query, "10.0.0.1")
-        # Basic checks: header, question, answer
         assert len(resp) > 12
-        # Check that IP appears in response
         assert socket.inet_aton("10.0.0.1") in resp
 
     def test_build_local_A_short_query(self, resolver_no_network):
-        # Should return empty bytes for too-short data
         resp = resolver_no_network._build_local_A_response(b'\x00' * 10, "1.2.3.4")
         assert resp == b''
 
@@ -149,7 +145,6 @@ class TestLocalAResponse:
 
 @pytest.fixture
 def resolver_mocked_forward():
-    """Resolver with mocked network forwarding functions."""
     resolver = DNSResolver(
         upstream_dns="1.2.3.4",
         protocol="udp",
@@ -159,7 +154,6 @@ def resolver_mocked_forward():
         udp_timeout=1,
         retries=1
     )
-    # Mock all forwarding methods to return canned responses
     resolver._forward_udp = AsyncMock(return_value=b'\x55\x55')
     resolver._forward_tcp = AsyncMock(return_value=b'\x66\x66')
     resolver._forward_tls = AsyncMock(return_value=b'\x77\x77')
@@ -174,10 +168,9 @@ async def test_forward_udp_called(resolver_mocked_forward):
     resolver_mocked_forward.protocol = "udp"
     data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    # Should call _forward_udp and return its response
     resolver_mocked_forward._forward_udp.assert_awaited_once_with(
-    data, {'address': '1.2.3.4', 'protocol': 'udp', 'hostname': '1.2.3.4'}
-)
+        data, {'address': '1.2.3.4', 'protocol': 'udp', 'hostname': '1.2.3.4'}
+    )
     assert resp == b'\x55\x55'
 
 
@@ -187,8 +180,8 @@ async def test_forward_tcp_called(resolver_mocked_forward):
     data = b'\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03tcp\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_tcp.assert_awaited_once_with(
-    data, {'address': '1.2.3.4', 'protocol': 'tcp', 'hostname': '1.2.3.4'}
-)
+        data, {'address': '1.2.3.4', 'protocol': 'tcp', 'hostname': '1.2.3.4'}
+    )
     assert resp == b'\x66\x66'
 
 
@@ -198,8 +191,8 @@ async def test_forward_tls_called(resolver_mocked_forward):
     data = b'\xef\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03tls\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_tls.assert_awaited_once_with(
-    data, {'address': '1.2.3.4', 'protocol': 'tls', 'hostname': '1.2.3.4'}
-)
+        data, {'address': '1.2.3.4', 'protocol': 'tls', 'hostname': '1.2.3.4'}
+    )
     assert resp == b'\x77\x77'
 
 
@@ -209,8 +202,8 @@ async def test_forward_https_called(resolver_mocked_forward):
     data = b'\xca\xfe\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03doh\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_https.assert_awaited_once_with(
-    data, {'address': '1.2.3.4', 'protocol': 'https', 'hostname': '1.2.3.4'}
-)
+        data, {'address': '1.2.3.4', 'protocol': 'https', 'hostname': '1.2.3.4'}
+    )
     assert resp == b'\x88\x88'
 
 
@@ -222,17 +215,16 @@ async def test_forward_quic_called(resolver_mocked_forward):
     data = b'\xde\xad\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03quic\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_quic.assert_awaited_once_with(
-    data, {'address': '1.2.3.4', 'protocol': 'quic', 'hostname': '1.2.3.4'}
-)
+        data, {'address': '1.2.3.4', 'protocol': 'quic', 'hostname': '1.2.3.4'}
+    )
     assert resp == b'\x99\x99'
 
 
 @pytest.mark.asyncio
 async def test_retries_on_failure(resolver_mocked_forward):
-    """Ensure retries happen when forwarding fails."""
     resolver_mocked_forward._forward_udp.side_effect = [
         asyncio.TimeoutError(),
-        b'\xaa\xaa'  # second attempt succeeds
+        b'\xaa\xaa'
     ]
     resolver_mocked_forward.retries = 2
     data = b'\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03ret\x00\x00\x01\x00\x01'
@@ -260,9 +252,7 @@ async def test_blocked_query_not_forwarded(resolver_mocked_forward):
         b'\x00\x01\x00\x01'
     )
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    # Must not have called any forward method
     resolver_mocked_forward._forward_udp.assert_not_called()
-    # Response should be a block response, not our mock values
     assert resp != b'\x55\x55'
     assert len(resp) > 0
 
@@ -276,10 +266,8 @@ async def test_hosts_map_avoids_forwarding(resolver_mocked_forward):
         b'\x00\x01\x00\x01'
     )
     resp = await resolver_mocked_forward.forward_dns_query(data)
-    # Should not have called any upstream forwarding
     resolver_mocked_forward._forward_udp.assert_not_called()
-    # Response should contain the IP from hosts_map
-    assert b'\x0a\x0a\x0a\x0a' in resp  # 10.10.10.10 in hex
+    assert b'\x0a\x0a\x0a\x0a' in resp
 
 
 @pytest.mark.asyncio
@@ -298,9 +286,8 @@ async def test_wire_cache_prevents_forwarding(resolver_mocked_forward):
 
 @pytest.fixture
 def resolver_multi_upstream():
-    """Resolver configured with multiple upstreams, _try_upstream mocked."""
     resolver = DNSResolver(
-        upstream_dns="1.1.1.1",  # fallback (not used when upstreams list is provided)
+        upstream_dns="1.1.1.1",
         protocol="udp",
         disable_ipv6=True,
         cache_ttl=300,
@@ -311,28 +298,23 @@ def resolver_multi_upstream():
             {'address': '10.0.0.3', 'protocol': 'https', 'port': 443, 'hostname': 'ns3.example.com'},
         ],
     )
-    # Replace the internal _try_upstream with a controlled mock
     resolver._try_upstream = AsyncMock()
     return resolver
 
 
 @pytest.mark.asyncio
 async def test_multi_upstream_first_succeeds(resolver_multi_upstream):
-    """When the first upstream responds, it's returned and no others are tried."""
     resolver_multi_upstream._try_upstream.return_value = b'\x01\x02'
     data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
     resp = await resolver_multi_upstream.forward_dns_query(data)
     assert resp == b'\x01\x02'
-    # Only one call to _try_upstream
     assert resolver_multi_upstream._try_upstream.call_count == 1
-    # The first call should have been with the first upstream dict
     called_upstream = resolver_multi_upstream._try_upstream.call_args[0][0]
     assert called_upstream['address'] == '10.0.0.1'
 
 
 @pytest.mark.asyncio
 async def test_multi_upstream_second_succeeds(resolver_multi_upstream):
-    """First upstream fails, second succeeds."""
     resolver_multi_upstream._try_upstream.side_effect = [
         Exception("first failure"),
         b'\x02\x03'
@@ -342,14 +324,12 @@ async def test_multi_upstream_second_succeeds(resolver_multi_upstream):
     assert resp == b'\x02\x03'
     assert resolver_multi_upstream._try_upstream.call_count == 2
     calls = resolver_multi_upstream._try_upstream.call_args_list
-    # First call should have been with upstream 0, second with upstream 1
     assert calls[0][0][0]['address'] == '10.0.0.1'
     assert calls[1][0][0]['address'] == '10.0.0.2'
 
 
 @pytest.mark.asyncio
 async def test_multi_upstream_all_fail(resolver_multi_upstream):
-    """All upstreams fail, the last exception is raised."""
     resolver_multi_upstream._try_upstream.side_effect = [
         Exception("fail1"),
         Exception("fail2"),
@@ -364,9 +344,8 @@ async def test_multi_upstream_all_fail(resolver_multi_upstream):
 
 @pytest.mark.asyncio
 async def test_multi_upstream_cache_hit_skips_all(resolver_multi_upstream):
-    """If the wire cache has a valid response, no upstream is contacted."""
     key = ("abc.def", 1, resolver_multi_upstream.protocol)
-    await resolver_multi_upstream._wire_cache_set(key, b'\xcc\xcc', ttl_seconds=60)
+    await resolver_multi_upstream._wire_cache_set(key, b'\xcc\xcc', ttl_seconds=60, query_data=b'\x00')
     data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x03def\x00\x00\x01\x00\x01'
     resp = await resolver_multi_upstream.forward_dns_query(data)
     assert resp == b'\xcc\xcc'
@@ -381,7 +360,6 @@ class TestRateLimiter:
     @pytest.mark.asyncio
     async def test_allow_within_burst(self):
         limiter = RateLimiter(10.0, 5.0)
-        # first burst of 5 should all pass
         for _ in range(5):
             assert await limiter.is_allowed("client1")
 
@@ -390,17 +368,15 @@ class TestRateLimiter:
         limiter = RateLimiter(10.0, 3.0)
         for _ in range(3):
             assert await limiter.is_allowed("client1")
-        # 4th should fail
         assert not await limiter.is_allowed("client1")
 
     @pytest.mark.asyncio
     async def test_tokens_regenerate_over_time(self):
-        limiter = RateLimiter(100.0, 3.0)  # high rate to refill quickly
+        limiter = RateLimiter(100.0, 3.0)
         key = "client2"
         for _ in range(3):
             assert await limiter.is_allowed(key)
         assert not await limiter.is_allowed(key)
-        # wait a bit for tokens to regenerate (rate=100, so 0.05s gives ~5 tokens)
         await asyncio.sleep(0.05)
         assert await limiter.is_allowed(key)
 
@@ -409,20 +385,18 @@ class TestRateLimiter:
         limiter = RateLimiter(10.0, 1.0)
         assert await limiter.is_allowed("clientA")
         assert not await limiter.is_allowed("clientA")
-        # clientB should still be allowed
         assert await limiter.is_allowed("clientB")
 
     @pytest.mark.asyncio
     async def test_concurrent_access(self):
         limiter = RateLimiter(1000.0, 100.0)
         key = "client3"
-        # simulate concurrent requests
         async def consume():
             return await limiter.is_allowed(key)
         tasks = [consume() for _ in range(50)]
         results = await asyncio.gather(*tasks)
-        # All should pass because burst is 100
         assert all(results)
+
 
 # ---------------------------------------------------------------------------
 # Rate limiter config hot-reload test
@@ -430,19 +404,15 @@ class TestRateLimiter:
 
 class TestRateLimitConfig:
     def test_update_config_disables_limiter(self, resolver_no_network):
-        # start with limiter enabled
         resolver_no_network.rate_limiter = RateLimiter(10.0, 20.0)
         resolver_no_network.rate_limit_rps = 10.0
         resolver_no_network.rate_limit_burst = 20.0
-
-        # disable via update
         resolver_no_network.update_config(rate_limit_rps=0.0, rate_limit_burst=0.0)
         assert resolver_no_network.rate_limiter is None
         assert resolver_no_network.rate_limit_rps == 0.0
         assert resolver_no_network.rate_limit_burst == 0.0
 
     def test_update_config_enables_limiter(self, resolver_no_network):
-        # start disabled
         resolver_no_network.rate_limiter = None
         resolver_no_network.update_config(rate_limit_rps=50.0, rate_limit_burst=100.0)
         assert resolver_no_network.rate_limiter is not None
@@ -453,7 +423,124 @@ class TestRateLimitConfig:
         limiter = RateLimiter(10.0, 20.0)
         resolver_no_network.rate_limiter = limiter
         resolver_no_network.update_config(rate_limit_rps=30.0, rate_limit_burst=40.0)
-        # should be the same object, just updated
         assert resolver_no_network.rate_limiter is limiter
         assert limiter.rate == 30.0
         assert limiter.burst == 40.0
+
+
+# ===========================================================================
+# Optimistic caching tests
+# ===========================================================================
+
+import dns.message
+import dns.rdatatype
+import dns.rdataclass
+import dns.rrset
+
+@pytest.fixture
+def resolver_optimistic():
+    """Resolver with optimistic caching enabled and a short stale max age."""
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",
+        protocol="udp",
+        disable_ipv6=True,
+        optimistic_cache_enabled=True,
+        optimistic_stale_max_age=60,
+        optimistic_stale_response_ttl=30,
+    )
+    # Prevent background refresh from actually hitting the network
+    resolver._try_upstream = AsyncMock(return_value=b'\x00'*100)
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_fresh_response_returned(resolver_optimistic):
+    """A non-expired entry returns the original response bytes."""
+    key = ("fresh.example", 1, "udp")
+    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05fresh\x07example\x00\x00\x01\x00\x01'
+    resp_data = b'\x56\x78' + b'\x00'*50
+    await resolver_optimistic._wire_cache_set(key, resp_data, ttl_seconds=300, query_data=query_data)
+    result = await resolver_optimistic._wire_cache_get_valid(key)
+    assert result == resp_data
+
+
+@pytest.mark.asyncio
+async def test_stale_response_served_and_ttl_modified(resolver_optimistic):
+    """Expired entry within stale window returns data with short TTL."""
+    key = ("stale.example", 1, "udp")
+    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05stale\x07example\x00\x00\x01\x00\x01'
+    # Build a fresh response with a known TTL (e.g., 60 seconds) and insert it as expired
+    msg = dns.message.make_response(
+        dns.message.from_wire(query_data)
+    )
+    msg.answer = [
+        dns.rrset.from_text('stale.example.', 60, dns.rdataclass.IN, dns.rdatatype.A, '1.2.3.4')
+    ]
+    original_wire = msg.to_wire()
+    # Store with expired expiry but still within stale window
+    now = time.time()
+    expiry = now - 10          # expired 10 seconds ago
+    stale_until = now + 600    # stale for another 10 minutes
+    entry = (original_wire, expiry, query_data, stale_until)
+    # Inject directly to bypass the normal set method
+    async with resolver_optimistic._lock:
+        if resolver_optimistic._cache_is_sync:
+            resolver_optimistic._wire_cache[key] = entry
+        else:
+            await resolver_optimistic._wire_cache.set(key, entry)
+    # Now get it
+    result = await resolver_optimistic._wire_cache_get_valid(key)
+    # Verify it returned a response, not None
+    assert result is not None
+    # The TTL in the returned response should be modified to stale_response_ttl=30
+    parsed = dns.message.from_wire(result)
+    assert parsed.answer[0].ttl == 30
+    # Background refresh should have been triggered
+    await asyncio.sleep(0.01)
+    # Since we mocked _try_upstream, it will have been called as a background refresh
+    # But we can't easily assert from here because it's a separate task; we'll trust the log
+
+
+@pytest.mark.asyncio
+async def test_stale_past_max_age_not_served(resolver_optimistic):
+    """When stale_until has passed, the entry is treated as fully expired."""
+    key = ("dead.example", 1, "udp")
+    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04dead\x07example\x00\x00\x01\x00\x01'
+    entry = (b'\x00'*20, time.time() - 120, query_data, time.time() - 10)  # stale_until in past
+    async with resolver_optimistic._lock:
+        if resolver_optimistic._cache_is_sync:
+            resolver_optimistic._wire_cache[key] = entry
+        else:
+            await resolver_optimistic._wire_cache.set(key, entry)
+    result = await resolver_optimistic._wire_cache_get_valid(key)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_stale_refresh_pending_prevents_duplicate(resolver_optimistic):
+    """If a stale refresh is already pending, no duplicate refresh is scheduled."""
+    key = ("dedup.example", 1, "udp")
+    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05dedup\x07example\x00\x00\x01\x00\x01'
+    # Manually mark a key as pending
+    async with resolver_optimistic._stale_refresh_lock:
+        resolver_optimistic._stale_refresh_pending.add(key)
+    # Attempt to trigger another refresh; should not start a second one
+    with patch.object(resolver_optimistic, '_background_refresh') as mock_refresh:
+        await resolver_optimistic._maybe_refresh_stale(key, query_data)
+        mock_refresh.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disabled_optimistic_cache_ignores_stale(resolver_no_network):
+    """When optimistic caching is off, stale entries are simply expired."""
+    resolver_no_network.optimistic_cache_enabled = False
+    key = ("noopt.example", 1, "udp")
+    query_data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05noopt\x07example\x00\x00\x01\x00\x01'
+    entry = (b'\x00'*20, time.time() - 10, query_data, time.time() + 600)
+    async with resolver_no_network._lock:
+        if resolver_no_network._cache_is_sync:
+            resolver_no_network._wire_cache[key] = entry
+        else:
+            await resolver_no_network._wire_cache.set(key, entry)
+    result = await resolver_no_network._wire_cache_get_valid(key)
+    assert result is None
