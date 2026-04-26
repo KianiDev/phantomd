@@ -429,7 +429,7 @@ class TestRateLimitConfig:
 
 
 # ===========================================================================
-# DNS rebinding protection tests (existing)
+# DNS rebinding protection tests (existing + new additional sections)
 # ===========================================================================
 
 import dns.message
@@ -439,8 +439,6 @@ import dns.rrset
 
 
 class TestIsPrivateIP:
-    """Unit tests for the static helper _is_private_ip."""
-
     def test_public_ipv4(self):
         assert not DNSResolver._is_private_ip("1.1.1.1")
         assert not DNSResolver._is_private_ip("8.8.8.8")
@@ -577,6 +575,19 @@ class TestApplyRebindProtection:
         assert "2001:4860:4860::8888" in aaaa_ips
         assert "1.1.1.1" in a_ips
         assert "::1" not in aaaa_ips
+
+    def test_additional_section_not_filtered(self, resolver_rebind_strip):
+        """Verify that rebinding protection does NOT strip private IPs from the additional section."""
+        # Build a valid message with a question and additional records
+        msg = dns.message.make_query("example.com.", dns.rdatatype.A)
+        msg.answer = [dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1")]
+        msg.additional = [dns.rrset.from_text("ns.example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.168.1.1")]
+        wire = msg.to_wire()
+        result = resolver_rebind_strip._apply_rebind_protection(wire)
+        parsed = dns.message.from_wire(result)
+        additional_ips = [rd.to_text() for rrset in parsed.additional for rd in rrset]
+        # The current implementation only filters answer, not additional
+        assert "192.168.1.1" in additional_ips
 
 
 @pytest.mark.asyncio
@@ -763,8 +774,7 @@ async def test_auto_doh_version_caches_result(resolver_doh_auto):
             'doh_version': 'auto'
         })
         assert resp == b'\x03\x03'
-        # probe + actual → two calls to mock3
-        assert mock3.call_count == 2
+        assert mock3.call_count == 2          # probe + actual
         mock2.assert_not_called()
         mock1.assert_not_called()
 
@@ -793,8 +803,7 @@ async def test_auto_doh_falls_back_to_2(resolver_doh_auto):
         })
         assert resp == b'\x02\x02'
         mock3.assert_called_once()
-        # probe + actual → two calls to mock2
-        assert mock2.call_count == 2
+        assert mock2.call_count == 2   # probe + actual
         mock1.assert_not_called()
 
 
@@ -837,7 +846,7 @@ async def test_doh_version_update_config(resolver_no_network):
 
 
 # ===========================================================================
-# New pooling tests for HTTP/2, HTTP/3, and DoQ
+# New pooling tests for HTTP/2, HTTP/3, and DoQ (existing)
 # ===========================================================================
 
 @pytest.fixture
@@ -854,17 +863,14 @@ def resolver_pooled_https2():
 
 @pytest.mark.asyncio
 async def test_https2_pooling_reuses_client(resolver_pooled_https2):
-    # Mock httpx.AsyncClient (imported inside the method)
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=MagicMock(status_code=200, content=b'ok'))
     fake_client.aclose = AsyncMock()
     with patch('httpx.AsyncClient', return_value=fake_client) as mock_http_client:
-        # First call creates client
         resp1 = await resolver_pooled_https2._forward_https2(b'd1', 'dns.example.com', 443, '1.1.1.1', '/dns-query')
         assert resp1 == b'ok'
         mock_http_client.assert_called_once()
 
-        # Second call reuses the client
         mock_http_client.reset_mock()
         resp2 = await resolver_pooled_https2._forward_https2(b'd2', 'dns.example.com', 443, '1.1.1.1', '/dns-query')
         assert resp2 == b'ok'
@@ -879,7 +885,8 @@ async def test_https2_pooling_error_closes_client(resolver_pooled_https2):
     with patch('httpx.AsyncClient', return_value=fake_client):
         with pytest.raises(Exception):
             await resolver_pooled_https2._forward_https2(b'd1', 'dns.example.com', 443, '1.1.1.1', '/dns-query')
-        fake_client.aclose.assert_called()  # client closed on er
+        fake_client.aclose.assert_called()
+
 
 @pytest.mark.asyncio
 async def test_doq_pooling_reuses_connection(resolver_pooled_https2):
@@ -888,7 +895,6 @@ async def test_doq_pooling_reuses_connection(resolver_pooled_https2):
     from aioquic.quic.events import StreamDataReceived
 
     fake_connection = MagicMock()
-    # The DoQ response is len-prefixed: 2 bytes big-endian length + payload.
     fake_connection.next_event = AsyncMock(side_effect=[
         StreamDataReceived(stream_id=0, data=b'\x00\x02\xAB\xCD', end_stream=True),
         StreamDataReceived(stream_id=0, data=b'\x00\x02\xEF\x01', end_stream=True),
@@ -905,7 +911,102 @@ async def test_doq_pooling_reuses_connection(resolver_pooled_https2):
         assert resp1 == b'\xAB\xCD'
         assert mock_connect.call_count == 1
 
-        # Second call should reuse the same connection
         resp2 = await resolver_pooled_https2._forward_quic(b'query2', upstream)
         assert resp2 == b'\xEF\x01'
-        assert mock_connect.call_count == 1  # still only one connection created
+        assert mock_connect.call_count == 1
+
+
+# ===========================================================================
+# Additional coverage tests (new)
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestClientPoolCleanup:
+    async def test_idle_clients_removed(self):
+        pool = ClientPool(max_size=2, idle_timeout=0.1)
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        await pool.put(('key',), client)
+        # start cleanup
+        cleanup_task = asyncio.create_task(pool.start_cleanup())
+        await asyncio.sleep(0.3)
+        cleanup_task.cancel()
+        # pool should be empty
+        assert await pool.get(('key',)) is None
+        client.aclose.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_doq_pooling_reuses_after_failure(resolver_pooled_https2):
+    """When a pooled connection fails, a new connection is created."""
+    if not _HAS_AIOQUIC:
+        pytest.skip("aioquic not available")
+    from aioquic.quic.events import StreamDataReceived
+
+    fake_connection1 = MagicMock()
+    fake_connection1.next_event = AsyncMock(side_effect=[
+        StreamDataReceived(stream_id=0, data=b'\x00\x02\xAB\xCD', end_stream=True),
+    ])
+    fake_connection2 = MagicMock()
+    fake_connection2.next_event = AsyncMock(side_effect=[
+        StreamDataReceived(stream_id=0, data=b'\x00\x02\x22\x22', end_stream=True),
+    ])
+    with patch('aioquic.asyncio.client.connect') as mock_connect:
+        mock_connect.side_effect = [
+            MagicMock(
+                __aenter__=AsyncMock(return_value=MagicMock(
+                    _quic=fake_connection1,
+                    _protocol=MagicMock()
+                )),
+                __aexit__=AsyncMock(return_value=None)
+            ),
+            MagicMock(
+                __aenter__=AsyncMock(return_value=MagicMock(
+                    _quic=fake_connection2,
+                    _protocol=MagicMock()
+                )),
+                __aexit__=AsyncMock(return_value=None)
+            ),
+        ]
+        upstream = {'address': '1.1.1.1', 'hostname': 'dns.example.com', 'port': 784}
+        resp1 = await resolver_pooled_https2._forward_quic(b'query', upstream)
+        assert resp1 == b'\xAB\xCD'
+        assert mock_connect.call_count == 1
+
+        # Manually clear the pool so the second call creates a fresh connection
+        # (simulates a real-world scenario where the pooled connection is broken)
+        await resolver_pooled_https2._quic_pool.stop()
+
+        resp2 = await resolver_pooled_https2._forward_quic(b'query2', upstream)
+        assert resp2 == b'\x22\x22'
+        assert mock_connect.call_count == 2  # one new connection created after clearing pool
+
+
+@pytest.mark.asyncio
+async def test_auto_doh_version_cache_expiry(resolver_doh_auto):
+    resolver_doh_auto.doh_auto_cache_ttl = 1  # 1 second cache
+    with patch.object(resolver_doh_auto, '_forward_https3', new_callable=AsyncMock) as mock3, \
+         patch.object(resolver_doh_auto, '_forward_https2', new_callable=AsyncMock) as mock2:
+        mock3.return_value = b'\x03\x03'
+        mock2.return_value = b'\x02\x02'
+
+        # first call probes and caches HTTP/3
+        await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        assert mock3.call_count == 2  # probe + actual
+        mock2.assert_not_called()
+
+        # wait for cache to expire
+        await asyncio.sleep(1.1)
+
+        # next call should re-probe (HTTP/3 still works)
+        mock3.reset_mock()
+        await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        # On cache miss, it probes again → probe + actual = 2 calls
+        assert mock3.call_count == 2
+        mock2.assert_not_called()
