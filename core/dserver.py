@@ -212,6 +212,8 @@ async def reload_resolver(holder: ResolverHolder,
         rebind_action=config.get("dns_rebind_action"),
         pool_max_size=config.get("pool_max_size"),
         pool_idle_timeout=config.get("pool_idle_timeout"),
+        doh_version=config.get("doh_version"),
+        doh_auto_cache_ttl=config.get("doh_auto_cache_ttl"),
     )
 
     if blocklists:
@@ -304,7 +306,9 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      dns_rebind_protection: bool = False,
                      dns_rebind_action: str = 'strip',
                      pool_max_size: int = 5,
-                     pool_idle_timeout: float = 60.0) -> None:
+                     pool_idle_timeout: float = 60.0,
+                     doh_version: str = 'auto',
+                     doh_auto_cache_ttl: int = 3600) -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -338,6 +342,8 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         rebind_action=dns_rebind_action,
         pool_max_size=pool_max_size,
         pool_idle_timeout=pool_idle_timeout,
+        doh_version=doh_version,
+        doh_auto_cache_ttl=doh_auto_cache_ttl,
     )
 
     holder = ResolverHolder(resolver)

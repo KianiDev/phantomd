@@ -85,9 +85,11 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'dns_chroot_dir': '',
             'dns_rebind_protection': False,
             'dns_rebind_action': 'strip',
-            # Connection pooling defaults
             'pool_max_size': 5,
             'pool_idle_timeout': 60.0,
+            # DoH version – default "auto" to probe the best protocol
+            'doh_version': 'auto',
+            'doh_auto_cache_ttl': 3600,
         }
     config.read(path)
 
@@ -202,9 +204,15 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     optimistic_stale_max_age: int = config.getint('advanced', 'optimistic_stale_max_age', fallback=86400)
     optimistic_stale_response_ttl: int = config.getint('advanced', 'optimistic_stale_response_ttl', fallback=30)
 
-    # NEW: connection pooling options
+    # connection pooling options
     pool_max_size: int = config.getint('advanced', 'pool_max_size', fallback=5)
     pool_idle_timeout: float = config.getfloat('advanced', 'pool_idle_timeout', fallback=60.0)
+
+    # NEW: DoH version options
+    doh_version: str = config.get('advanced', 'doh_version', fallback='auto').strip().lower()
+    if doh_version not in ('auto', '1.1', '2', '3'):
+        doh_version = 'auto'
+    doh_auto_cache_ttl: int = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
 
     # --- Multi-upstream parsing ---
     upstreams: List[Dict[str, Any]] = []
@@ -225,6 +233,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 except ValueError:
                     port = None
             else:
+                # default ports per protocol
                 if proto == 'tls':
                     port = 853
                 elif proto == 'https':
@@ -234,11 +243,16 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 else:
                     port = 53
             hostname = config.get(section, 'hostname', fallback='') or address
+            # optional per-upstream doh_version
+            us_doh_version = config.get(section, 'doh_version', fallback=doh_version).lower()
+            if us_doh_version not in ('auto', '1.1', '2', '3'):
+                us_doh_version = doh_version
             upstreams.append({
                 'address': address,
                 'protocol': proto,
                 'port': port,
                 'hostname': hostname,
+                'doh_version': us_doh_version,
             })
 
     return {
@@ -309,7 +323,8 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'dns_chroot_dir': dns_chroot_dir,
         'dns_rebind_protection': dns_rebind_protection,
         'dns_rebind_action': dns_rebind_action,
-        # Connection pooling
         'pool_max_size': pool_max_size,
         'pool_idle_timeout': pool_idle_timeout,
+        'doh_version': doh_version,
+        'doh_auto_cache_ttl': doh_auto_cache_ttl,
     }

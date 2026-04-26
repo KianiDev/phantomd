@@ -89,10 +89,12 @@ def main() -> None:
     dns_chroot_dir_val: str = str(config.get("dns_chroot_dir", ""))
     dns_rebind_protection_val: bool = bool(config.get("dns_rebind_protection", False))
     dns_rebind_action_val: str = str(config.get("dns_rebind_action", "strip"))
-
-    # NEW: connection pooling config
     pool_max_size_val: int = int(config.get("pool_max_size", 5))
     pool_idle_timeout_val: float = float(config.get("pool_idle_timeout", 60.0))
+
+    # NEW: DoH version configuration
+    doh_version_val: str = str(config.get("doh_version", "auto"))
+    doh_auto_cache_ttl_val: int = int(config.get("doh_auto_cache_ttl", 3600))
 
     # DHCP configuration
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
@@ -245,6 +247,8 @@ def main() -> None:
             dns_rebind_action=dns_rebind_action_val,
             pool_max_size=pool_max_size_val,
             pool_idle_timeout=pool_idle_timeout_val,
+            doh_version=doh_version_val,
+            doh_auto_cache_ttl=doh_auto_cache_ttl_val,
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None

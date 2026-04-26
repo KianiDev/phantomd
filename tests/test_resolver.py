@@ -603,7 +603,7 @@ async def test_forward_query_applies_rebind(resolver_rebind_strip):
 
 
 # ===========================================================================
-# Connection pool tests
+# Connection pool tests (existing)
 # ===========================================================================
 
 @pytest.mark.asyncio
@@ -641,9 +641,7 @@ class TestConnectionPool:
         await pool.put(("host", 53), reader, writer1)
         await pool.put(("host", 53), reader, writer2)
         await pool.put(("host", 53), reader, writer3)
-        # pool should have size 2; writer3 should have been closed
         writer3.close.assert_called_once()
-        # pool is LIFO — last inserted is returned first
         assert await pool.get(("host", 53)) == (reader, writer2)
         assert await pool.get(("host", 53)) == (reader, writer1)
         assert await pool.get(("host", 53)) is None
@@ -663,7 +661,7 @@ class TestConnectionPool:
 
 
 # ---------------------------------------------------------------------------
-# Resolver pooling integration tests
+# Resolver pooling integration tests (existing)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -677,23 +675,20 @@ async def test_resolver_tcp_pooling():
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     writer.is_closing.return_value = False
-    # side_effect must provide 4 values: length + response × 2 queries
     reader.readexactly = AsyncMock(side_effect=[
-        b'\x00\x04',           # 1st query: length prefix
-        b'\xAA\xBB\xCC\xDD',   # 1st query: response
-        b'\x00\x04',           # 2nd query: length prefix
-        b'\x11\x22\x33\x44',   # 2nd query: response
+        b'\x00\x04',           # 1st: length
+        b'\xAA\xBB\xCC\xDD',   # 1st: response
+        b'\x00\x04',           # 2nd: length
+        b'\x11\x22\x33\x44',   # 2nd: response
     ])
     resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
     with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open:
         mock_open.return_value = (reader, writer)
         data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
-        # first call should open a connection
         resp1 = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
         assert resp1 == b'\xAA\xBB\xCC\xDD'
         mock_open.assert_called_once_with("1.1.1.1", 53)
         writer.drain.assert_called()
-        # second call should reuse the same connection (no new open)
         mock_open.reset_mock()
         resp2 = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
         assert resp2 == b'\x11\x22\x33\x44'
@@ -710,7 +705,6 @@ async def test_resolver_tcp_pooling_on_error_closes():
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     writer.is_closing.return_value = False
-    # first call fails
     reader.readexactly = AsyncMock(side_effect=OSError("connection broken"))
     resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
     with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open:
@@ -718,9 +712,7 @@ async def test_resolver_tcp_pooling_on_error_closes():
         data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
         with pytest.raises(OSError):
             await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
-        # the connection should be closed and NOT returned to pool
         writer.close.assert_called()
-        # subsequent call should open a new connection
         mock_open.reset_mock()
         reader2 = MagicMock(spec=asyncio.StreamReader)
         writer2 = MagicMock(spec=asyncio.StreamWriter)
@@ -729,4 +721,123 @@ async def test_resolver_tcp_pooling_on_error_closes():
         mock_open.return_value = (reader2, writer2)
         resp = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
         assert resp == b'\x55\x55\x55\x55'
-        mock_open.assert_called_once_with("1.1.1.1", 53)  # new connection
+        mock_open.assert_called_once_with("1.1.1.1", 53)
+
+
+# ===========================================================================
+# DoH version selection tests (new)
+# ===========================================================================
+
+@pytest.fixture
+def resolver_doh_auto():
+    """Resolver with auto DoH version, mocked forwarding methods and a working _with_retries."""
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",
+        protocol="udp",
+        disable_ipv6=True,
+        doh_version="auto",
+        doh_auto_cache_ttl=60,
+    )
+    resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
+    resolver._forward_https1 = AsyncMock(return_value=b'HTTP/1.1 response')
+    resolver._forward_https2 = AsyncMock(return_value=b'HTTP/2 response')
+    resolver._forward_https3 = AsyncMock(return_value=b'HTTP/3 response')
+
+    async def _real_with_retries(fn, data, timeout):
+        # Actually call the async fn and return its result
+        return await fn(data)
+
+    resolver._with_retries = _real_with_retries
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_auto_doh_version_caches_result(resolver_doh_auto):
+    """Auto negotiation probes and caches the best version."""
+    with patch.object(resolver_doh_auto, '_forward_https3', new_callable=AsyncMock) as mock3, \
+            patch.object(resolver_doh_auto, '_forward_https2', new_callable=AsyncMock) as mock2, \
+            patch.object(resolver_doh_auto, '_forward_https1', new_callable=AsyncMock) as mock1:
+        mock3.return_value = b'\x03\x03'
+        mock2.return_value = b'\x02\x02'
+        mock1.return_value = b'\x01\x01'
+
+        # First query triggers probe + actual
+        resp = await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        assert resp == b'\x03\x03'
+        # probe + actual query → two calls
+        assert mock3.call_count == 2
+        mock2.assert_not_called()
+        mock1.assert_not_called()
+
+        # Second query uses cached version, one more call (no new probes)
+        mock3.reset_mock()
+        resp2 = await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        assert resp2 == b'\x03\x03'
+        mock3.assert_called_once()  # only the actual query, probe skipped
+        mock2.assert_not_called()
+        mock1.assert_not_called()
+
+
+
+@pytest.mark.asyncio
+async def test_auto_doh_falls_back_to_2(resolver_doh_auto):
+    """If HTTP/3 fails, HTTP/2 is tried and cached."""
+    with patch.object(resolver_doh_auto, '_forward_https3', new_callable=AsyncMock) as mock3, \
+            patch.object(resolver_doh_auto, '_forward_https2', new_callable=AsyncMock) as mock2, \
+            patch.object(resolver_doh_auto, '_forward_https1', new_callable=AsyncMock) as mock1:
+        mock3.side_effect = Exception("HTTP/3 not available")
+        mock2.return_value = b'\x02\x02'
+
+        resp = await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        assert resp == b'\x02\x02'
+        mock3.assert_called_once()   # probe attempt (HTTP/3 fails)
+        # HTTP/2 called for both probe and actual query
+        assert mock2.call_count == 2
+        mock1.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_auto_doh_falls_back_to_1(resolver_doh_auto):
+    """If both HTTP/3 and HTTP/2 fail, HTTP/1.1 is used."""
+    with patch.object(resolver_doh_auto, '_forward_https3', new_callable=AsyncMock) as mock3, \
+         patch.object(resolver_doh_auto, '_forward_https2', new_callable=AsyncMock) as mock2, \
+         patch.object(resolver_doh_auto, '_forward_https1', new_callable=AsyncMock) as mock1:
+        mock3.side_effect = Exception("HTTP/3 not available")
+        mock2.side_effect = Exception("No H2")
+        mock1.return_value = b'\x01\x01'
+
+        resp = await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': 'auto'
+        })
+        assert resp == b'\x01\x01'
+        mock3.assert_called_once()
+        mock2.assert_called_once()
+        mock1.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_doh_version_explicit(resolver_doh_auto):
+    """Explicit version in upstream dict overrides global default."""
+    with patch.object(resolver_doh_auto, '_forward_https2', new_callable=AsyncMock) as mock2:
+        mock2.return_value = b'\x02\x02'
+        resp = await resolver_doh_auto._forward_https(b'\x00'*12, {
+            'address': '1.1.1.1', 'port': 443, 'hostname': 'cloudflare-dns.com', 'path': '/dns-query',
+            'doh_version': '2'
+        })
+        assert resp == b'\x02\x02'
+        mock2.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_doh_version_update_config(resolver_no_network):
+    """update_config correctly changes doh_version and doh_auto_cache_ttl."""
+    resolver_no_network.update_config(doh_version='2', doh_auto_cache_ttl=1800)
+    assert resolver_no_network.doh_version == '2'
+    assert resolver_no_network.doh_auto_cache_ttl == 1800
