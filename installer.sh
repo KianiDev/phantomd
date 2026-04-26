@@ -8,7 +8,7 @@ set -eu
 #   ./installer.sh            # fresh install (interactive)
 #   ./installer.sh --update   # update an existing installation (non‑interactive, keeps config)
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
 INSTALL_DIR="/opt/phantomd"
 VENV_DIR="$INSTALL_DIR/venv"

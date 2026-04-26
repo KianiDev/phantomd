@@ -111,6 +111,86 @@ class RateLimiter:
             return False
 
 
+class ConnectionPool:
+    """A simple connection pool for TCP and TLS connections."""
+    def __init__(self, max_size: int = 5, idle_timeout: float = 60.0) -> None:
+        self.max_size: int = max_size
+        self.idle_timeout: float = idle_timeout
+        self._pools: Dict[Tuple, List[Tuple[asyncio.StreamReader, asyncio.StreamWriter, float]]] = {}
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    async def get(self, key: Tuple) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """Borrow an existing, healthy connection from the pool or return None."""
+        async with self._lock:
+            if key in self._pools:
+                while self._pools[key]:
+                    reader, writer, _ = self._pools[key].pop()
+                    if not writer.is_closing():
+                        return reader, writer
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+        return None
+
+    async def put(self, key: Tuple, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Return a connection to the pool if it's still healthy."""
+        async with self._lock:
+            if writer.is_closing():
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return
+
+            if key not in self._pools:
+                self._pools[key] = []
+            if len(self._pools[key]) < self.max_size:
+                self._pools[key].append((reader, writer, time.time()))
+            else:
+                writer.close()
+
+    async def start_cleanup(self) -> None:
+        """Periodically close idle connections."""
+        async def _cleanup():
+            while True:
+                await asyncio.sleep(self.idle_timeout / 2)
+                now = time.time()
+                async with self._lock:
+                    keys_to_purge = []
+                    for key in list(self._pools.keys()):
+                        keep = []
+                        for reader, writer, last_used in self._pools[key]:
+                            if now - last_used > self.idle_timeout or writer.is_closing():
+                                try:
+                                    writer.close()
+                                except Exception:
+                                    pass
+                            else:
+                                keep.append((reader, writer, last_used))
+                        if keep:
+                            self._pools[key] = keep
+                        else:
+                            keys_to_purge.append(key)
+                    for key in keys_to_purge:
+                        del self._pools[key]
+        self._cleanup_task = asyncio.create_task(_cleanup())
+
+    async def stop(self) -> None:
+        """Close all pooled connections and cancel cleanup."""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+        async with self._lock:
+            for key in list(self._pools.values()):
+                for _, writer, _ in key:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+            self._pools.clear()
+
+
 class DNSResolver:
     """Async, robust DNS resolver/forwarder supporting UDP/TCP/DoT/DoH/DoQ (DoQ optional).
 
@@ -124,6 +204,7 @@ class DNSResolver:
       - Multi-upstream with automatic failover (configurable upstream list)
       - Optimistic caching (serve-stale per RFC 8767)
       - DNS rebinding protection (strip or block private IPs)
+      - Connection pooling for TCP/TLS upstream connections
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -157,7 +238,9 @@ class DNSResolver:
                   optimistic_stale_max_age: int = 86400,
                   optimistic_stale_response_ttl: int = 30,
                   rebind_protection_enabled: bool = False,
-                  rebind_action: str = 'strip') -> None:
+                  rebind_action: str = 'strip',
+                  pool_max_size: int = 5,
+                  pool_idle_timeout: float = 60.0) -> None:
         # --- single upstream fallback ---
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
@@ -261,13 +344,15 @@ class DNSResolver:
         self.optimistic_cache_enabled: bool = optimistic_cache_enabled
         self.stale_max_age: int = optimistic_stale_max_age
         self.stale_response_ttl: int = optimistic_stale_response_ttl
-        # set of in-flight keys to avoid duplicate refresh tasks
         self._stale_refresh_pending: Set[str] = set()
         self._stale_refresh_lock: asyncio.Lock = asyncio.Lock()
 
         # --- DNS rebinding protection ---
         self.rebind_protection_enabled: bool = rebind_protection_enabled
         self.rebind_action: str = rebind_action
+
+        # --- Connection pool ---
+        self._pool: ConnectionPool = ConnectionPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
 
     # ---------- blocklist helpers ----------
     def set_blocklist(self, domains: Iterable[str]) -> None:
@@ -433,7 +518,6 @@ class DNSResolver:
                 self._stale_refresh_pending.discard(key)
 
     def _set_response_ttl(self, response_bytes: bytes, ttl: int) -> bytes:
-        """Set all TTLs in the DNS answer/authority/additional sections to the given value."""
         if _HAS_DNSPY:
             try:
                 msg = dns.message.from_wire(response_bytes)
@@ -891,7 +975,6 @@ class DNSResolver:
                     except Exception as e:
                         self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
                         raise
-                # Apply rebinding protection after successful response
                 if self.rebind_protection_enabled:
                     resp = self._apply_rebind_protection(resp)
                 ttl = self._extract_min_ttl(resp)
@@ -907,7 +990,7 @@ class DNSResolver:
         self.logger.error("all upstreams failed")
         raise last_exc or Exception("All upstreams exhausted")
 
-    # --- forwarding implementations (now accept optional upstream) ---
+    # --- forwarding implementations (with connection pooling) ---
 
     async def _forward_udp(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
@@ -959,19 +1042,27 @@ class DNSResolver:
         else:
             host = upstream['address']
             port = upstream.get('port', 53)
-        resolved = await self._resolve_upstream_ip(host)
-        if self.disable_ipv6 and self._is_ipv6_address(resolved):
-            raise Exception("IPv6 disabled but resolved to IPv6")
-        reader, writer = await asyncio.open_connection(resolved, int(port))
+
+        key = (host, port)
+        pooled = await self._pool.get(key)
+        if pooled:
+            reader, writer = pooled
+        else:
+            resolved = await self._resolve_upstream_ip(host)
+            if self.disable_ipv6 and self._is_ipv6_address(resolved):
+                raise Exception("IPv6 disabled but resolved to IPv6")
+            reader, writer = await asyncio.open_connection(resolved, int(port))
         try:
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
-            return await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
-        finally:
+            resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
+            await self._pool.put(key, reader, writer)
+            return resp
+        except Exception:
             writer.close()
-            await writer.wait_closed()
+            raise
 
     async def _forward_tls(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
@@ -981,23 +1072,31 @@ class DNSResolver:
             host = upstream['address']
             port = upstream.get('port', 853)
             hostname = upstream.get('hostname', host)
-        resolved = await self._resolve_upstream_ip(host)
-        if self.disable_ipv6 and self._is_ipv6_address(resolved):
-            raise Exception("IPv6 disabled but resolved to IPv6")
-        ssl_ctx = ssl.create_default_context()
-        reader, writer = await asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=hostname)
-        try:
+
+        key = (host, port, hostname)
+        pooled = await self._pool.get(key)
+        if pooled:
+            reader, writer = pooled
+        else:
+            resolved = await self._resolve_upstream_ip(host)
+            if self.disable_ipv6 and self._is_ipv6_address(resolved):
+                raise Exception("IPv6 disabled but resolved to IPv6")
+            ssl_ctx = ssl.create_default_context()
+            reader, writer = await asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=hostname)
             ssl_obj = writer.get_extra_info('ssl_object')
             if ssl_obj is not None and self.pinned_certs:
                 await self._check_cert_pins(hostname, ssl_obj)
+        try:
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
-            return await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
-        finally:
+            resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
+            await self._pool.put(key, reader, writer)
+            return resp
+        except Exception:
             writer.close()
-            await writer.wait_closed()
+            raise
 
     async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
@@ -1495,7 +1594,7 @@ class DNSResolver:
                     ip.is_reserved or
                     ip.is_multicast or
                     ip.is_unspecified)
-        else:  # IPv6
+        else:
             return (ip.is_private or
                     ip.is_loopback or
                     ip.is_link_local or
@@ -1558,7 +1657,9 @@ class DNSResolver:
                       optimistic_stale_max_age: Optional[int] = None,
                       optimistic_stale_response_ttl: Optional[int] = None,
                       rebind_protection_enabled: Optional[bool] = None,
-                      rebind_action: Optional[str] = None) -> None:
+                      rebind_action: Optional[str] = None,
+                      pool_max_size: Optional[int] = None,
+                      pool_idle_timeout: Optional[float] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -1615,11 +1716,15 @@ class DNSResolver:
             self.stale_max_age = optimistic_stale_max_age
         if optimistic_stale_response_ttl is not None:
             self.stale_response_ttl = optimistic_stale_response_ttl
-        # DNS rebinding protection updates
         if rebind_protection_enabled is not None:
             self.rebind_protection_enabled = rebind_protection_enabled
         if rebind_action is not None:
             self.rebind_action = rebind_action.lower()
+        # Connection pool updates
+        if pool_max_size is not None:
+            self._pool.max_size = pool_max_size
+        if pool_idle_timeout is not None:
+            self._pool.idle_timeout = pool_idle_timeout
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
                          "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "

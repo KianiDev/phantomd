@@ -83,9 +83,11 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'dns_privilege_drop_user': '',
             'dns_privilege_drop_group': '',
             'dns_chroot_dir': '',
-            # DNS rebinding protection defaults
             'dns_rebind_protection': False,
             'dns_rebind_action': 'strip',
+            # Connection pooling defaults
+            'pool_max_size': 5,
+            'pool_idle_timeout': 60.0,
         }
     config.read(path)
 
@@ -182,7 +184,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     dns_privilege_drop_group: str = config.get('security', 'dns_privilege_drop_group', fallback='')
     dns_chroot_dir: str = config.get('security', 'dns_chroot_dir', fallback='')
 
-    # DNS rebinding protection (new)
+    # DNS rebinding protection
     dns_rebind_protection: bool = config.getboolean('security', 'dns_rebind_protection', fallback=False)
     dns_rebind_action: str = config.get('security', 'dns_rebind_action', fallback='strip').lower()
     if dns_rebind_action not in ('strip', 'block'):
@@ -199,6 +201,10 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     optimistic_cache_enabled: bool = config.getboolean('advanced', 'optimistic_cache_enabled', fallback=False)
     optimistic_stale_max_age: int = config.getint('advanced', 'optimistic_stale_max_age', fallback=86400)
     optimistic_stale_response_ttl: int = config.getint('advanced', 'optimistic_stale_response_ttl', fallback=30)
+
+    # NEW: connection pooling options
+    pool_max_size: int = config.getint('advanced', 'pool_max_size', fallback=5)
+    pool_idle_timeout: float = config.getfloat('advanced', 'pool_idle_timeout', fallback=60.0)
 
     # --- Multi-upstream parsing ---
     upstreams: List[Dict[str, Any]] = []
@@ -303,4 +309,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'dns_chroot_dir': dns_chroot_dir,
         'dns_rebind_protection': dns_rebind_protection,
         'dns_rebind_action': dns_rebind_action,
+        # Connection pooling
+        'pool_max_size': pool_max_size,
+        'pool_idle_timeout': pool_idle_timeout,
     }

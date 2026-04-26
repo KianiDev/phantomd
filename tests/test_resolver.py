@@ -6,7 +6,7 @@ import struct
 import time
 import socket
 
-from core.resolver import DNSResolver, _HAS_CACHETOOLS, _HAS_AIOQUIC, RateLimiter
+from core.resolver import DNSResolver, _HAS_CACHETOOLS, _HAS_AIOQUIC, RateLimiter, ConnectionPool
 
 
 class TestParsing:
@@ -429,7 +429,7 @@ class TestRateLimitConfig:
 
 
 # ===========================================================================
-# DNS rebinding protection tests
+# DNS rebinding protection tests (existing)
 # ===========================================================================
 
 import dns.message
@@ -474,7 +474,6 @@ class TestIsPrivateIP:
 
 @pytest.fixture
 def resolver_rebind_strip():
-    """Resolver with rebinding protection enabled in 'strip' mode."""
     resolver = DNSResolver(
         upstream_dns="1.1.1.1",
         protocol="udp",
@@ -488,7 +487,6 @@ def resolver_rebind_strip():
 
 @pytest.fixture
 def resolver_rebind_block():
-    """Resolver with rebinding protection enabled in 'block' mode."""
     resolver = DNSResolver(
         upstream_dns="1.1.1.1",
         protocol="udp",
@@ -502,7 +500,6 @@ def resolver_rebind_block():
 
 class TestApplyRebindProtection:
     def test_strip_private_ipv4(self, resolver_rebind_strip):
-        """Private IPv4 addresses are stripped; public ones remain."""
         msg = dns.message.Message()
         msg.answer = [
             dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "192.168.1.1"),
@@ -515,7 +512,6 @@ class TestApplyRebindProtection:
         assert "192.168.1.1" not in ips
 
     def test_strip_all_private_leaves_rrset_empty(self, resolver_rebind_strip):
-        """When all IPs in an rrset are private, the entire rrset is removed."""
         msg = dns.message.Message()
         msg.answer = [
             dns.rrset.from_text("internal.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1", "192.168.1.1"),
@@ -526,23 +522,17 @@ class TestApplyRebindProtection:
         assert len(parsed.answer) == 0
 
     def test_block_all_private_returns_nxdomain(self, resolver_rebind_block):
-        """With 'block' mode, all private answer returns NXDOMAIN."""
         msg = dns.message.Message()
         msg.answer = [
             dns.rrset.from_text("internal.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1"),
         ]
         wire = msg.to_wire()
         result = resolver_rebind_block._apply_rebind_protection(wire)
-
-        # The result should be a valid DNS message; if it's NXDOMAIN, the opcode
-        # flags will contain rcode 3.  The message may be a minimal one with zero
-        # questions, so we inspect the flags directly rather than calling from_wire.
         parsed = dns.message.Message()
         parsed.flags = struct.unpack("!H", result[2:4])[0]
         assert (parsed.flags & 0x000F) == 3  # NXDOMAIN
 
     def test_block_public_ips_preserved(self, resolver_rebind_block):
-        """Public-only answer passes through 'block' mode unchanged."""
         msg = dns.message.Message()
         msg.answer = [
             dns.rrset.from_text("safe.example.", 60, dns.rdataclass.IN, dns.rdatatype.A, "1.1.1.1", "8.8.8.8"),
@@ -555,7 +545,6 @@ class TestApplyRebindProtection:
         assert "8.8.8.8" in ips
 
     def test_disabled_does_nothing(self):
-        """With rebinding disabled, the response passes through unchanged."""
         resolver = DNSResolver(
             upstream_dns="1.1.1.1",
             protocol="udp",
@@ -571,10 +560,9 @@ class TestApplyRebindProtection:
         parsed = dns.message.from_wire(result)
         ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
         assert "1.1.1.1" in ips
-        assert "10.0.0.1" in ips  # not stripped
+        assert "10.0.0.1" in ips
 
     def test_mixed_aaaa_and_a(self, resolver_rebind_strip):
-        """Private AAAA is stripped; public A remains."""
         msg = dns.message.Message()
         msg.answer = [
             dns.rrset.from_text("dual.example.", 60, dns.rdataclass.IN, dns.rdatatype.AAAA, "2001:4860:4860::8888"),
@@ -588,13 +576,11 @@ class TestApplyRebindProtection:
         a_ips = [rd.to_text() for rrset in parsed.answer if rrset.rdtype == dns.rdatatype.A for rd in rrset]
         assert "2001:4860:4860::8888" in aaaa_ips
         assert "1.1.1.1" in a_ips
-        assert "::1" not in aaaa_ips  # private AAAA stripped
+        assert "::1" not in aaaa_ips
 
 
 @pytest.mark.asyncio
 async def test_forward_query_applies_rebind(resolver_rebind_strip):
-    """Full forward_dns_query flow applies rebind protection after upstream response."""
-    # Build an upstream response with one public, one private IP
     msg = dns.message.make_response(
         dns.message.from_wire(
             b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
@@ -614,3 +600,133 @@ async def test_forward_query_applies_rebind(resolver_rebind_strip):
     ips = [rd.to_text() for rrset in parsed.answer for rd in rrset]
     assert "1.1.1.1" in ips
     assert "192.168.1.1" not in ips
+
+
+# ===========================================================================
+# Connection pool tests
+# ===========================================================================
+
+@pytest.mark.asyncio
+class TestConnectionPool:
+    async def test_get_empty(self):
+        pool = ConnectionPool(max_size=2)
+        assert await pool.get(("host", 53)) is None
+
+    async def test_put_and_get(self):
+        pool = ConnectionPool(max_size=2)
+        reader = MagicMock(spec=asyncio.StreamReader)
+        writer = MagicMock(spec=asyncio.StreamWriter)
+        writer.is_closing.return_value = False
+        await pool.put(("host", 53), reader, writer)
+        result = await pool.get(("host", 53))
+        assert result == (reader, writer)
+
+    async def test_closed_connection_not_returned(self):
+        pool = ConnectionPool(max_size=2)
+        reader = MagicMock(spec=asyncio.StreamReader)
+        writer = MagicMock(spec=asyncio.StreamWriter)
+        writer.is_closing.return_value = True
+        await pool.put(("host", 53), reader, writer)
+        assert await pool.get(("host", 53)) is None
+
+    async def test_max_size_exceeded_closes_extra(self):
+        pool = ConnectionPool(max_size=2)
+        reader = MagicMock(spec=asyncio.StreamReader)
+        writer1 = MagicMock(spec=asyncio.StreamWriter)
+        writer1.is_closing.return_value = False
+        writer2 = MagicMock(spec=asyncio.StreamWriter)
+        writer2.is_closing.return_value = False
+        writer3 = MagicMock(spec=asyncio.StreamWriter)
+        writer3.is_closing.return_value = False
+        await pool.put(("host", 53), reader, writer1)
+        await pool.put(("host", 53), reader, writer2)
+        await pool.put(("host", 53), reader, writer3)
+        # pool should have size 2; writer3 should have been closed
+        writer3.close.assert_called_once()
+        # pool is LIFO — last inserted is returned first
+        assert await pool.get(("host", 53)) == (reader, writer2)
+        assert await pool.get(("host", 53)) == (reader, writer1)
+        assert await pool.get(("host", 53)) is None
+
+    async def test_different_keys(self):
+        pool = ConnectionPool(max_size=2)
+        reader = MagicMock(spec=asyncio.StreamReader)
+        writer_a = MagicMock(spec=asyncio.StreamWriter)
+        writer_a.is_closing.return_value = False
+        writer_b = MagicMock(spec=asyncio.StreamWriter)
+        writer_b.is_closing.return_value = False
+        await pool.put(("host_a", 53), reader, writer_a)
+        await pool.put(("host_b", 853, "tls.example"), reader, writer_b)
+        assert await pool.get(("host_a", 53)) == (reader, writer_a)
+        assert await pool.get(("host_b", 853, "tls.example")) == (reader, writer_b)
+        assert await pool.get(("host_a", 53)) is None
+
+
+# ---------------------------------------------------------------------------
+# Resolver pooling integration tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolver_tcp_pooling():
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",
+        protocol="tcp",
+        disable_ipv6=True,
+        pool_max_size=2,
+    )
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    writer.is_closing.return_value = False
+    # side_effect must provide 4 values: length + response × 2 queries
+    reader.readexactly = AsyncMock(side_effect=[
+        b'\x00\x04',           # 1st query: length prefix
+        b'\xAA\xBB\xCC\xDD',   # 1st query: response
+        b'\x00\x04',           # 2nd query: length prefix
+        b'\x11\x22\x33\x44',   # 2nd query: response
+    ])
+    resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
+    with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open:
+        mock_open.return_value = (reader, writer)
+        data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
+        # first call should open a connection
+        resp1 = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
+        assert resp1 == b'\xAA\xBB\xCC\xDD'
+        mock_open.assert_called_once_with("1.1.1.1", 53)
+        writer.drain.assert_called()
+        # second call should reuse the same connection (no new open)
+        mock_open.reset_mock()
+        resp2 = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
+        assert resp2 == b'\x11\x22\x33\x44'
+        mock_open.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_resolver_tcp_pooling_on_error_closes():
+    resolver = DNSResolver(
+        upstream_dns="1.1.1.1",
+        protocol="tcp",
+        disable_ipv6=True,
+        pool_max_size=2,
+    )
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    writer.is_closing.return_value = False
+    # first call fails
+    reader.readexactly = AsyncMock(side_effect=OSError("connection broken"))
+    resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
+    with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open:
+        mock_open.return_value = (reader, writer)
+        data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03abc\x00\x00\x01\x00\x01'
+        with pytest.raises(OSError):
+            await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
+        # the connection should be closed and NOT returned to pool
+        writer.close.assert_called()
+        # subsequent call should open a new connection
+        mock_open.reset_mock()
+        reader2 = MagicMock(spec=asyncio.StreamReader)
+        writer2 = MagicMock(spec=asyncio.StreamWriter)
+        writer2.is_closing.return_value = False
+        reader2.readexactly = AsyncMock(side_effect=[b'\x00\x04', b'\x55\x55\x55\x55'])
+        mock_open.return_value = (reader2, writer2)
+        resp = await resolver._forward_tcp(data, {'address': '1.1.1.1', 'protocol': 'tcp', 'port': 53})
+        assert resp == b'\x55\x55\x55\x55'
+        mock_open.assert_called_once_with("1.1.1.1", 53)  # new connection
