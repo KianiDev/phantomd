@@ -20,10 +20,12 @@ except Exception:
 try:
     import aioquic.asyncio
     from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.connection import QuicConnection
     _HAS_AIOQUIC = True
 except Exception:
     aioquic = None
     QuicConfiguration = None
+    QuicConnection = None
     _HAS_AIOQUIC = False
 
 # optional prometheus
@@ -187,6 +189,71 @@ class ConnectionPool:
             self._pools.clear()
 
 
+class ClientPool:
+    """A pool that holds arbitrary client objects (httpx clients, QUIC connections, etc.)."""
+    def __init__(self, max_size: int = 5, idle_timeout: float = 60.0) -> None:
+        self.max_size: int = max_size
+        self.idle_timeout: float = idle_timeout
+        self._pools: Dict[Tuple, List[Tuple[Any, float]]] = {}
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    async def get(self, key: Tuple) -> Optional[Any]:
+        async with self._lock:
+            if key in self._pools and self._pools[key]:
+                client, _ = self._pools[key].pop()
+                return client
+        return None
+
+    async def put(self, key: Tuple, client: Any) -> None:
+        async with self._lock:
+            if key not in self._pools:
+                self._pools[key] = []
+            if len(self._pools[key]) < self.max_size:
+                self._pools[key].append((client, time.time()))
+            else:
+                await self._close_client(client)
+
+    async def start_cleanup(self) -> None:
+        async def _cleanup():
+            while True:
+                await asyncio.sleep(self.idle_timeout / 2)
+                now = time.time()
+                async with self._lock:
+                    for key in list(self._pools.keys()):
+                        keep = []
+                        for client, last_used in self._pools[key]:
+                            if now - last_used > self.idle_timeout:
+                                await self._close_client(client)
+                            else:
+                                keep.append((client, last_used))
+                        self._pools[key] = keep
+                        if not self._pools[key]:
+                            del self._pools[key]
+        self._cleanup_task = asyncio.create_task(_cleanup())
+
+    async def stop(self) -> None:
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+        async with self._lock:
+            for key in list(self._pools.values()):
+                for client, _ in key:
+                    await self._close_client(client)
+            self._pools.clear()
+
+    async def _close_client(self, client: Any) -> None:
+        try:
+            if hasattr(client, 'aclose'):
+                await client.aclose()
+            elif hasattr(client, 'close'):
+                if hasattr(client, 'close'):
+                    client.close()
+                if hasattr(client, '_transport'):
+                    client._transport.close()
+        except Exception:
+            pass
+
+
 class DNSResolver:
     """Async, robust DNS resolver/forwarder supporting UDP/TCP/DoT/DoH/DoH2/DoH3/DoQ.
 
@@ -200,7 +267,7 @@ class DNSResolver:
       - Multi-upstream with automatic failover (configurable upstream list)
       - Optimistic caching (serve-stale per RFC 8767)
       - DNS rebinding protection (strip or block private IPs)
-      - Connection pooling for TCP/TLS upstream connections
+      - Connection pooling for TCP, TLS, HTTP/2, HTTP/3, and DoQ
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -349,13 +416,16 @@ class DNSResolver:
         self.rebind_protection_enabled: bool = rebind_protection_enabled
         self.rebind_action: str = rebind_action
 
-        # --- Connection pool ---
-        self._pool: ConnectionPool = ConnectionPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
+        # --- Connection pools ---
+        self._tcp_pool: ConnectionPool = ConnectionPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
+        self._h2_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
+        self._h3_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
+        self._quic_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
 
         # --- DoH version negotiation ---
         self.doh_version: str = doh_version
         self.doh_auto_cache_ttl: int = doh_auto_cache_ttl
-        self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}   # host -> (version, expiry)
+        self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
 
     # ---------- blocklist helpers ----------
@@ -1048,7 +1118,7 @@ class DNSResolver:
             port = upstream.get('port', 53)
 
         key = (host, port)
-        pooled = await self._pool.get(key)
+        pooled = await self._tcp_pool.get(key)
         if pooled:
             reader, writer = pooled
         else:
@@ -1062,7 +1132,7 @@ class DNSResolver:
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
             resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
-            await self._pool.put(key, reader, writer)
+            await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
             writer.close()
@@ -1078,7 +1148,7 @@ class DNSResolver:
             hostname = upstream.get('hostname', host)
 
         key = (host, port, hostname)
-        pooled = await self._pool.get(key)
+        pooled = await self._tcp_pool.get(key)
         if pooled:
             reader, writer = pooled
         else:
@@ -1096,7 +1166,7 @@ class DNSResolver:
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
             resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
-            await self._pool.put(key, reader, writer)
+            await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
             writer.close()
@@ -1127,12 +1197,11 @@ class DNSResolver:
         elif version == '2':
             return await self._with_retries(
                 lambda d: self._forward_https2(d, hostname, port, host, path), data, timeout=self.doh_timeout)
-        else:  # 1.1
+        else:
             return await self._with_retries(
                 lambda d: self._forward_https1(d, hostname, port, host, path), data, timeout=self.doh_timeout)
 
     async def _get_auto_doh_version(self, hostname: str, port: int, host: str, path: str) -> str:
-        """Determine the best DoH version for an upstream, cache the result."""
         now = time.time()
         async with self._doh_auto_lock:
             if hostname in self._doh_auto_cache:
@@ -1161,7 +1230,6 @@ class DNSResolver:
         return version
 
     async def _forward_https1(self, data: bytes, hostname: str, port: int, host: str, path: str) -> bytes:
-        """Classic HTTP/1.1 DoH with Connection: close."""
         resolved = await self._resolve_upstream_ip(host)
         ssl_ctx = ssl.create_default_context()
         reader, writer = await asyncio.open_connection(resolved, port, ssl=ssl_ctx, server_hostname=hostname)
@@ -1254,15 +1322,20 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
+    # ---------- DoH/2 (HTTP/2) with pooling ----------
     async def _forward_https2(self, data: bytes, hostname: str, port: int, host: str, path: str) -> bytes:
-        """DoH via HTTP/2 using httpx."""
         try:
             import httpx
         except ImportError:
             raise RuntimeError("httpx is required for HTTP/2 DoH (install with: pip install httpx[h2])")
 
+        key = (hostname, port)
+        client: Optional[httpx.AsyncClient] = await self._h2_pool.get(key)
+        if client is None:
+            client = httpx.AsyncClient(http2=True, verify=ssl.create_default_context())
+
         url = f"https://{hostname}:{port}{path}"
-        async with httpx.AsyncClient(http2=True, verify=ssl.create_default_context()) as client:
+        try:
             resp = await client.post(
                 url,
                 headers={
@@ -1275,15 +1348,24 @@ class DNSResolver:
             )
             if resp.status_code < 200 or resp.status_code >= 300:
                 raise Exception(f"HTTP/2 upstream returned status {resp.status_code}")
-            return resp.content
+            result = resp.content
+            await self._h2_pool.put(key, client)
+            return result
+        except Exception:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise
 
+    # ---------- DoH/3 (HTTP/3) with pooling ----------
     async def _forward_https3(self, data: bytes, hostname: str, port: int, host: str, path: str) -> bytes:
-        """DoH via HTTP/3 (QUIC) using aioquic.h3."""
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic is required for HTTP/3 DoH (install with: pip install aioquic)")
         try:
             from aioquic.h3.connection import H3Connection
             from aioquic.h3.events import HeadersReceived, DataReceived
+            from aioquic.asyncio.client import connect as quic_connect
         except ImportError:
             raise RuntimeError("aioquic.h3 not available; upgrade aioquic to the latest version")
 
@@ -1291,32 +1373,76 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
+        key = (hostname, port)
+        ctx = await self._h3_pool.get(key)
+        if ctx is not None:
+            connection, h3 = ctx
+            stream_id = h3.get_next_available_stream_id()
+            try:
+                h3.send_headers(
+                    stream_id=stream_id,
+                    headers=[
+                        (b":method", b"POST"),
+                        (b":scheme", b"https"),
+                        (b":authority", hostname.encode()),
+                        (b":path", path.encode()),
+                        (b"content-type", b"application/dns-message"),
+                        (b"accept", b"application/dns-message"),
+                        (b"content-length", str(len(data)).encode()),
+                    ],
+                    end_stream=False
+                )
+                h3.send_data(stream_id, data, end_stream=True)
+
+                response_data = bytearray()
+                response_complete = asyncio.Event()
+
+                async def handle_events():
+                    while not response_complete.is_set():
+                        try:
+                            event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
+                            for h3_event in h3.handle_event(event):
+                                if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
+                                    response_data.extend(h3_event.data)
+                                    if h3_event.stream_ended:
+                                        response_complete.set()
+                                elif isinstance(h3_event, HeadersReceived) and h3_event.stream_ended:
+                                    response_complete.set()
+                        except asyncio.TimeoutError:
+                            pass
+
+                await asyncio.wait_for(handle_events(), timeout=self.doh_timeout)
+                await self._h3_pool.put(key, (connection, h3))
+                return bytes(response_data)
+            except Exception:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
+
+        # No pooled connection – create new one
         configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
         configuration.server_name = hostname
-        from aioquic.asyncio.client import connect as quic_connect
-
-        response_data = bytearray()
-        response_complete = asyncio.Event()
 
         class H3Protocol:
-            def __init__(self, connection):
-                self.connection = connection
-                self.h3 = H3Connection(connection)
+            def __init__(self, conn):
+                self.conn = conn
+                self.h3 = H3Connection(conn)
 
             def quic_event_received(self, event):
                 for h3_event in self.h3.handle_event(event):
-                    if isinstance(h3_event, DataReceived):
-                        response_data.extend(h3_event.data)
-                        if h3_event.stream_ended:
-                            response_complete.set()
-                    elif isinstance(h3_event, HeadersReceived):
-                        pass  # we could check status, but simplified
+                    pass
 
         async with quic_connect(resolved, port, configuration=configuration,
                                 create_protocol=lambda conn: H3Protocol(conn)) as client:
-            proto = client._protocol  # the H3Protocol instance
-            proto.h3.send_headers(
-                stream_id=proto.h3.get_next_available_stream_id(),
+            proto = client._protocol
+            connection = client._quic
+            h3 = proto.h3
+
+            stream_id = h3.get_next_available_stream_id()
+            h3.send_headers(
+                stream_id=stream_id,
                 headers=[
                     (b":method", b"POST"),
                     (b":scheme", b"https"),
@@ -1328,14 +1454,160 @@ class DNSResolver:
                 ],
                 end_stream=False
             )
-            proto.h3.send_data(client._quic.get_next_available_stream_id(), data, end_stream=True)
-            await asyncio.wait_for(response_complete.wait(), timeout=self.doh_timeout)
+            h3.send_data(stream_id, data, end_stream=True)
+
+            response_data = bytearray()
+            response_complete = asyncio.Event()
+
+            async def handle_events():
+                while not response_complete.is_set():
+                    try:
+                        event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
+                        for h3_event in h3.handle_event(event):
+                            if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
+                                response_data.extend(h3_event.data)
+                                if h3_event.stream_ended:
+                                    response_complete.set()
+                            elif isinstance(h3_event, HeadersReceived) and h3_event.stream_ended:
+                                response_complete.set()
+                    except asyncio.TimeoutError:
+                        pass
+
+            await asyncio.wait_for(handle_events(), timeout=self.doh_timeout)
+            await self._h3_pool.put(key, (connection, h3))
             return bytes(response_data)
 
-    # --- existing QUIC forward (for DoQ) unchanged ---
+    # ---------- DoQ with pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
-        # ... (unchanged, omitted for brevity but must be present)
-        pass  # placeholder — actual code is in the original
+        if not _HAS_AIOQUIC:
+            raise RuntimeError("aioquic not available for DoQ")
+        from aioquic.quic.events import StreamDataReceived
+
+        if upstream is None:
+            hostname, port = self._split_hostport(self.upstream_dns, default_port=784)
+        else:
+            hostname = upstream.get('hostname', upstream['address'])
+            port = upstream.get('port', 784)
+
+        resolved = await self._resolve_upstream_ip(hostname)
+        if self.disable_ipv6 and self._is_ipv6_address(resolved):
+            raise Exception("IPv6 disabled but resolved to IPv6")
+
+        key = (hostname, port)
+        pooled = await self._quic_pool.get(key)
+        if pooled is not None:
+            connection, quic_obj = pooled
+            try:
+                stream_id = quic_obj.get_next_available_stream_id()
+                quic_obj.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+
+                response_data = bytearray()
+                response_complete = asyncio.Event()
+
+                async def wait_response():
+                    while not response_complete.is_set():
+                        try:
+                            event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
+                            if isinstance(event, StreamDataReceived):
+                                response_data.extend(event.data)
+                                if event.end_stream:
+                                    response_complete.set()
+                        except asyncio.TimeoutError:
+                            pass
+
+                await asyncio.wait_for(wait_response(), timeout=self.doh_timeout)
+                resp = bytes(response_data)
+                if len(resp) < 2:
+                    raise Exception("Invalid DoQ response")
+                resp_len = int.from_bytes(resp[:2], "big")
+                if resp_len + 2 > len(resp):
+                    raise Exception("DoQ response truncated")
+                await self._quic_pool.put(key, (connection, quic_obj))
+                return resp[2:2+resp_len]
+            except Exception:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
+
+        configuration = QuicConfiguration(is_client=True, alpn_protocols=["doq"],
+                                          verify_mode=ssl.CERT_REQUIRED)
+        from aioquic.asyncio.client import connect as quic_connect
+
+        class DoQProto:
+            def quic_event_received(self, event):
+                pass
+
+        response_data = bytearray()
+        response_event = asyncio.Event()
+
+        async with quic_connect(resolved, port, configuration=configuration,
+                                create_protocol=lambda *a, **k: DoQProto()) as client:
+            quic_obj = client._quic
+            connection = quic_obj
+            stream_id = quic_obj.get_next_available_stream_id()
+            quic_obj.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+
+            if self.pinned_certs:
+                der = self._get_quic_cert_der(client)
+                if der:
+                    await self._check_cert_pins(hostname, self._DERPeerWrapper(der))
+
+            async def wait_response():
+                while not response_event.is_set():
+                    try:
+                        event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
+                        if isinstance(event, StreamDataReceived):
+                            response_data.extend(event.data)
+                            if event.end_stream:
+                                response_event.set()
+                    except asyncio.TimeoutError:
+                        pass
+
+            await asyncio.wait_for(wait_response(), timeout=self.doh_timeout)
+            resp = bytes(response_data)
+            if len(resp) < 2:
+                raise Exception("Invalid DoQ response")
+            resp_len = int.from_bytes(resp[:2], "big")
+            if resp_len + 2 > len(resp):
+                raise Exception("DoQ response truncated")
+            await self._quic_pool.put(key, (connection, quic_obj))
+            return resp[2:2+resp_len]
+
+    def _get_quic_cert_der(self, client: Any) -> Optional[bytes]:
+        try:
+            if hasattr(client, 'get_peer_certificate'):
+                cert = client.get_peer_certificate()
+                if cert is not None:
+                    if hasattr(cert, 'public_bytes'):
+                        from cryptography.hazmat.primitives.serialization import Encoding
+                        return cert.public_bytes(Encoding.DER)
+                    if isinstance(cert, bytes):
+                        return cert
+            if hasattr(client, '_quic'):
+                quic = client._quic
+                if hasattr(quic, 'tls') and hasattr(quic.tls, '_peer_certificate'):
+                    cert = quic.tls._peer_certificate
+                    if cert is not None:
+                        if hasattr(cert, 'public_bytes'):
+                            from cryptography.hazmat.primitives.serialization import Encoding
+                            return cert.public_bytes(Encoding.DER)
+                        if isinstance(cert, bytes):
+                            return cert
+            get_chain = getattr(client, 'get_peer_cert_chain', None)
+            if callable(get_chain):
+                chain = get_chain()
+                if chain and isinstance(chain, (list, tuple)):
+                    first = chain[0]
+                    if isinstance(first, bytes):
+                        return first
+                    if hasattr(first, 'public_bytes'):
+                        from cryptography.hazmat.primitives.serialization import Encoding
+                        return first.public_bytes(Encoding.DER)
+        except Exception:
+            pass
+        return None
 
     # --- name resolution helpers ---
     def _split_hostport(self, hostport: str, default_port: int = 53) -> Tuple[str, int]:
@@ -1743,9 +2015,15 @@ class DNSResolver:
         if rebind_action is not None:
             self.rebind_action = rebind_action.lower()
         if pool_max_size is not None:
-            self._pool.max_size = pool_max_size
+            self._tcp_pool.max_size = pool_max_size
+            self._h2_pool.max_size = pool_max_size
+            self._h3_pool.max_size = pool_max_size
+            self._quic_pool.max_size = pool_max_size
         if pool_idle_timeout is not None:
-            self._pool.idle_timeout = pool_idle_timeout
+            self._tcp_pool.idle_timeout = pool_idle_timeout
+            self._h2_pool.idle_timeout = pool_idle_timeout
+            self._h3_pool.idle_timeout = pool_idle_timeout
+            self._quic_pool.idle_timeout = pool_idle_timeout
         if doh_version is not None:
             self.doh_version = doh_version
         if doh_auto_cache_ttl is not None:
