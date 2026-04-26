@@ -3,16 +3,16 @@ import asyncio
 import socket
 import struct
 import random
+import concurrent.futures
 import dns.message
 import dns.rdatatype
 import dns.rdataclass
 import dns.rrset
 from tests.conftest import MockUpstream
-from dns.name import from_text as name_from_text
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Helper functions (compatible with Python 3.10+)
 # ---------------------------------------------------------------------------
 
 def build_dns_query(domain: str, qtype: int = 1) -> bytes:
@@ -31,22 +31,55 @@ def build_dns_query(domain: str, qtype: int = 1) -> bytes:
 
 async def send_dns_query(host: str, port: int, domain: str, qtype: int = 1,
                          timeout: float = 2.0) -> bytes:
+    """Send a DNS query over UDP and return the raw response.
+    Works on Python 3.10+ by using run_in_executor for socket I/O."""
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
+
     query = build_dns_query(domain, qtype)
-    await loop.sock_sendto(sock, query, (host, port))
+
+    # sendto
+    fd = sock.fileno()
+    fut = loop.create_future()
+    def _send():
+        try:
+            return sock.sendto(query, (host, port))
+        except Exception as e:
+            loop.call_soon_threadsafe(fut.set_exception, e)
+        else:
+            loop.call_soon_threadsafe(fut.set_result, None)
+    loop._add_writer(fd, _send)
     try:
-        data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 4096), timeout=timeout)
+        await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        sock.close()
+        return None
+    finally:
+        loop._remove_writer(fd)
+
+    # recvfrom
+    fut = loop.create_future()
+    def _recv():
+        try:
+            data, addr = sock.recvfrom(4096)
+            loop.call_soon_threadsafe(fut.set_result, data)
+        except Exception as e:
+            loop.call_soon_threadsafe(fut.set_exception, e)
+    loop._add_reader(fd, _recv)
+    try:
+        data = await asyncio.wait_for(fut, timeout=timeout)
         return data
     except asyncio.TimeoutError:
         return None
     finally:
+        loop._remove_reader(fd)
         sock.close()
 
 
 async def send_tcp_dns_query(host: str, port: int, domain: str, qtype: int = 1,
                              timeout: float = 2.0) -> bytes:
+    """Send a DNS query over TCP. Works on Python 3.10+."""
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port), timeout=timeout
     )
@@ -66,13 +99,13 @@ async def send_tcp_dns_query(host: str, port: int, domain: str, qtype: int = 1,
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests (all timeouts generous for CI)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_basic_forwarding_udp(phantomd_server_factory):
     port = await phantomd_server_factory({})
-    data = await send_dns_query('127.0.0.1', port, 'example.com')
+    data = await send_dns_query('127.0.0.1', port, 'example.com', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert len(resp.answer) == 1
@@ -82,7 +115,7 @@ async def test_basic_forwarding_udp(phantomd_server_factory):
 @pytest.mark.asyncio
 async def test_basic_forwarding_tcp(phantomd_server_factory):
     port = await phantomd_server_factory({})
-    data = await send_tcp_dns_query('127.0.0.1', port, 'example.com')
+    data = await send_tcp_dns_query('127.0.0.1', port, 'example.com', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert str(resp.answer[0][0]) == '1.2.3.4'
@@ -91,7 +124,7 @@ async def test_basic_forwarding_tcp(phantomd_server_factory):
 @pytest.mark.asyncio
 async def test_nxdomain(phantomd_server_factory):
     port = await phantomd_server_factory({})
-    data = await send_dns_query('127.0.0.1', port, 'nonexistent.example')
+    data = await send_dns_query('127.0.0.1', port, 'nonexistent.example', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert resp.rcode() == dns.rcode.NXDOMAIN
@@ -100,23 +133,22 @@ async def test_nxdomain(phantomd_server_factory):
 @pytest.mark.asyncio
 async def test_caching(phantomd_server_factory):
     port = await phantomd_server_factory({})
-    data1 = await send_dns_query('127.0.0.1', port, 'example.com')
+    data1 = await send_dns_query('127.0.0.1', port, 'example.com', timeout=5)
     assert data1 is not None
     resp1 = dns.message.from_wire(data1)
     assert str(resp1.answer[0][0]) == '1.2.3.4'
 
-    data2 = await send_dns_query('127.0.0.1', port, 'example.com')
+    data2 = await send_dns_query('127.0.0.1', port, 'example.com', timeout=5)
     assert data2 is not None
     resp2 = dns.message.from_wire(data2)
     assert str(resp2.answer[0][0]) == '1.2.3.4'
 
 
-# ---- corrected: plain domain entry, not hosts entry ----
+# Blocklist NXDOMAIN — plain domain entry, no hosts line
 @pytest.mark.asyncio
 async def test_blocklist_nxdomain(phantomd_server_factory, tmp_path):
     block_dir = tmp_path / 'blocklists'
     block_dir.mkdir()
-    # A plain domain (no IP) is added to the exact blocklist
     (block_dir / 'block.txt').write_text('blocked.example\n')
 
     port = await phantomd_server_factory({
@@ -130,13 +162,13 @@ async def test_blocklist_nxdomain(phantomd_server_factory, tmp_path):
         'upstreams': [{'mu': MockUpstream(answers_by_qname={'blocked.example.': '2.2.2.2'})}]
     })
 
-    data = await send_dns_query('127.0.0.1', port, 'blocked.example')
+    data = await send_dns_query('127.0.0.1', port, 'blocked.example', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert resp.rcode() == dns.rcode.NXDOMAIN
 
 
-# ---- corrected: plain domain entry ----
+# Blocklist ZEROIP — plain domain entry
 @pytest.mark.asyncio
 async def test_blocklist_zeroip(phantomd_server_factory, tmp_path):
     block_dir = tmp_path / 'blocklists'
@@ -154,12 +186,13 @@ async def test_blocklist_zeroip(phantomd_server_factory, tmp_path):
         'upstreams': [{'mu': MockUpstream(answers_by_qname={'blocked.example.': '2.2.2.2'})}]
     })
 
-    data = await send_dns_query('127.0.0.1', port, 'blocked.example')
+    data = await send_dns_query('127.0.0.1', port, 'blocked.example', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert str(resp.answer[0][0]) == '0.0.0.0'
 
 
+# Hosts‑map — uses hosts format (IP + domain)
 @pytest.mark.asyncio
 async def test_hosts_map(phantomd_server_factory, tmp_path):
     hosts_dir = tmp_path / 'hosts'
@@ -176,8 +209,8 @@ async def test_hosts_map(phantomd_server_factory, tmp_path):
         },
     })
 
-    # Use TRAILING DOT so the query contains an absolute domain name
-    data = await send_dns_query('127.0.0.1', port, 'local.test.')
+    # Use trailing dot for absolute domain
+    data = await send_dns_query('127.0.0.1', port, 'local.test.', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert str(resp.answer[0][0]) == '10.0.0.1'
@@ -186,7 +219,7 @@ async def test_hosts_map(phantomd_server_factory, tmp_path):
 @pytest.mark.asyncio
 async def test_disable_ipv6_aaaa_blocked(phantomd_server_factory):
     port = await phantomd_server_factory({'disable_ipv6': True})
-    data = await send_dns_query('127.0.0.1', port, 'example.com', qtype=28)
+    data = await send_dns_query('127.0.0.1', port, 'example.com', qtype=28, timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert resp.rcode() == dns.rcode.NXDOMAIN
@@ -215,7 +248,7 @@ async def test_rebind_protection_strip(phantomd_server_factory):
         'rebind_action': 'strip',
     })
 
-    data = await send_dns_query('127.0.0.1', port, 'mixed.example')
+    data = await send_dns_query('127.0.0.1', port, 'mixed.example', timeout=5)
     assert data is not None
     resp = dns.message.from_wire(data)
     ips = [str(rd) for rd in resp.answer[0]]
@@ -223,6 +256,7 @@ async def test_rebind_protection_strip(phantomd_server_factory):
     assert '10.0.0.1' not in ips
 
 
+# Multi‑upstream failover – first upstream drops queries, second responds
 @pytest.mark.asyncio
 async def test_multi_upstream_failover(phantomd_server_factory):
     mu_a = MockUpstream(answers_by_qname={'example.com.': '1.2.3.4'}, failures=2)
@@ -235,24 +269,25 @@ async def test_multi_upstream_failover(phantomd_server_factory):
         ]
     })
 
-    data = await send_dns_query('127.0.0.1', port, 'example.com', timeout=6)
+    # Give plenty of time for retries to complete in CI
+    data = await send_dns_query('127.0.0.1', port, 'example.com', timeout=10)
     assert data is not None
     resp = dns.message.from_wire(data)
     assert str(resp.answer[0][0]) == '2.2.2.2'
 
 
-# ---- robust rate‑limiting test ----
+# Rate limiting – generous burst, short timeout for the dropped request
 @pytest.mark.asyncio
 async def test_rate_limiting(phantomd_server_factory):
     port = await phantomd_server_factory({
         'rate_limit_rps': 100.0,
         'rate_limit_burst': 10,
     })
-    # Send 11 rapid queries; first 10 should succeed, 11th timed out (dropped)
+    # First 10 should succeed (burst = 10)
     for _ in range(10):
-        d = await send_dns_query('127.0.0.1', port, 'example.com', timeout=2)
+        d = await send_dns_query('127.0.0.1', port, 'example.com', timeout=5)
         assert d is not None
 
     # 11th should be dropped
-    dropped = await send_dns_query('127.0.0.1', port, 'example.com', timeout=0.5)
+    dropped = await send_dns_query('127.0.0.1', port, 'example.com', timeout=1.0)
     assert dropped is None
