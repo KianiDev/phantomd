@@ -479,7 +479,6 @@ class DNSResolver:
                         ip = parts[0]
                         domain = parts[1].lower().rstrip('.')
                         hosts_map[domain] = (ip,)
-                        exact_set.add(domain)
                         continue
                     domain = parts[0].lower().rstrip('.')
                     if domain.startswith('.'):
