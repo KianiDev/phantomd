@@ -400,11 +400,13 @@ class DNSResolver:
         # --- Rate limiter ---
         self.rate_limit_rps: float = rate_limit_rps
         self.rate_limit_burst: float = rate_limit_burst
-        if rate_limit_rps > 0 and rate_limit_burst > 0:
-            self.rate_limiter: Optional[RateLimiter] = RateLimiter(rate_limit_rps, rate_limit_burst)
+        if rate_limit_rps > 0:
+            # A burst of 0 still needs at least 1 initial token so the first
+            # request isn't blocked immediately.
+            effective_burst = max(1.0, rate_limit_burst)
+            self.rate_limiter: Optional[RateLimiter] = RateLimiter(rate_limit_rps, effective_burst)
         else:
             self.rate_limiter = None
-
         # --- Optimistic caching ---
         self.optimistic_cache_enabled: bool = optimistic_cache_enabled
         self.stale_max_age: int = optimistic_stale_max_age
