@@ -88,11 +88,21 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'pool_idle_timeout': 60.0,
             'doh_version': 'auto',
             'doh_auto_cache_ttl': 3600,
-            # NEW bootstrap section defaults
             'bootstrap': {
                 'servers': ['1.1.1.1:53', '8.8.8.8:53'],
                 'timeout': 2.0,
                 'retries': 2,
+            },
+            # NEW MITM section defaults
+            'mitm': {
+                'enabled': False,
+                'listen_ip': '0.0.0.0',
+                'listen_port': 8443,
+                'socket_path': '/tmp/phantomd_doh.sock',
+                'ad_block_enabled': False,
+                'forward_non_doh': True,
+                'ca_dir': '/var/lib/phantomd-mitm/ca',
+                'cert_cache_ttl': 3600,
             }
         }
         return default
@@ -218,7 +228,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         doh_version = 'auto'
     doh_auto_cache_ttl: int = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
 
-    # --- Bootstrap section (NEW) ---
+    # --- Bootstrap section ---
     bootstrap_servers_raw: str = config.get('bootstrap', 'servers', fallback='')
     if bootstrap_servers_raw.strip():
         bootstrap_servers = [s.strip() for s in bootstrap_servers_raw.split(',') if s.strip()]
@@ -252,7 +262,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 except ValueError:
                     port = None
             else:
-                # default ports per protocol
                 if proto == 'tls':
                     port = 853
                 elif proto == 'https':
@@ -262,9 +271,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 else:
                     port = 53
             hostname = config.get(section, 'hostname', fallback='') or address
-            # New: path for DoH
             path = config.get(section, 'path', fallback='')
-            # optional per-upstream doh_version
             us_doh_version = config.get(section, 'doh_version', fallback=doh_version).lower()
             if us_doh_version not in ('auto', '1.1', '2', '3'):
                 us_doh_version = doh_version
@@ -274,8 +281,21 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 'port': port,
                 'hostname': hostname,
                 'doh_version': us_doh_version,
-                'path': path,          # NEW field
+                'path': path,
             })
+
+    # --- MITM section parsing ---
+    mitm_enabled: bool = config.getboolean('mitm', 'enabled', fallback=False)
+    mitm = {
+        'enabled': mitm_enabled,
+        'listen_ip': config.get('mitm', 'listen_ip', fallback='0.0.0.0'),
+        'listen_port': config.getint('mitm', 'listen_port', fallback=8443),
+        'socket_path': config.get('mitm', 'socket_path', fallback='/tmp/phantomd_doh.sock'),
+        'ad_block_enabled': config.getboolean('mitm', 'ad_block_enabled', fallback=False),
+        'forward_non_doh': config.getboolean('mitm', 'forward_non_doh', fallback=True),
+        'ca_dir': config.get('mitm', 'ca_dir', fallback='/var/lib/phantomd-mitm/ca'),
+        'cert_cache_ttl': config.getint('mitm', 'cert_cache_ttl', fallback=3600),
+    }
 
     return {
         'verbose': verbose_flag,
@@ -284,7 +304,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'listen_loopback_only': listen_loopback_only,
         'upstream_dns': config.get('upstream', 'dns_server', fallback='1.1.1.1'),
         'protocol': config.get('upstream', 'dns_protocol', fallback='udp'),
-        # removed dns_resolver_server
         'disable_ipv6': disable_ipv6,
         'blocklists': {
             'enabled': block_enabled,
@@ -349,5 +368,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'pool_idle_timeout': pool_idle_timeout,
         'doh_version': doh_version,
         'doh_auto_cache_ttl': doh_auto_cache_ttl,
-        'bootstrap': bootstrap,   # NEW
+        'bootstrap': bootstrap,
+        'mitm': mitm,   # NEW
     }

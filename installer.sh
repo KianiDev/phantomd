@@ -8,7 +8,7 @@ set -eu
 #   ./installer.sh            # fresh install (interactive)
 #   ./installer.sh --update   # update an existing installation (non‑interactive, keeps config)
 
-VERSION="1.10.0"
+VERSION="1.12.0b"
 REPO_URL="https://codeload.github.com/KianiDev/phantomd/tar.gz/refs/tags/v$VERSION"
 INSTALL_DIR="/opt/phantomd"
 VENV_DIR="$INSTALL_DIR/venv"
@@ -75,6 +75,70 @@ else
   pip install --upgrade pip
   pip install httpx aiohttp dnspython requests cachetools aiosqlite cryptography prometheus_client uvloop || true
 fi
+
+# ---------- Download pre‑compiled Rust MITM proxy ----------
+echo "Downloading Rust MITM proxy..."
+
+# Detect architecture
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)
+        TARGET="x86_64-unknown-linux-gnu"
+        ;;
+    aarch64)
+        TARGET="aarch64-unknown-linux-gnu"
+        ;;
+    *)
+        echo "Unsupported architecture: $ARCH. Will try to compile from source."
+        TARGET=""
+        ;;
+esac
+
+# Get the latest release tag from GitHub (or use a specific version)
+# We'll use the version from the VERSION variable defined at top of installer.sh
+LATEST_TAG="v$VERSION"
+BINARY_URL="https://github.com/KianiDev/phantomd/releases/download/$LATEST_TAG/phantomd-mitm"
+
+if [ -n "$TARGET" ]; then
+    # Try to download pre-built binary
+    if curl -fsSL "$BINARY_URL" -o /usr/local/bin/phantomd-mitm; then
+        chmod +x /usr/local/bin/phantomd-mitm
+        echo "MITM proxy binary downloaded successfully."
+    else
+        echo "Pre-built binary not available for $ARCH or version. Falling back to compilation."
+        TARGET=""
+    fi
+fi
+
+if [ -z "$TARGET" ]; then
+    # Fallback: compile from source
+    echo "Compiling Rust MITM proxy from source..."
+    if ! command -v rustc &> /dev/null; then
+        echo "Rust not found. Installing via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+    fi
+    cd "$INSTALL_DIR/mitm"
+    cargo build --release
+    cp target/release/phantomd-mitm /usr/local/bin/
+    chmod +x /usr/local/bin/phantomd-mitm
+fi
+
+cat > /etc/systemd/system/phantomd-mitm.service <<'EOF'
+[Unit]
+Description=PhantomD MITM Proxy
+After=network.target
+Requires=phantomd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/phantomd-mitm /etc/phantomd/mitm-config.toml
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # ---------- OS helpers ----------
 if command -v apt-get >/dev/null 2>&1; then

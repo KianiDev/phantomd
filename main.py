@@ -6,6 +6,8 @@ import logging
 import asyncio
 import signal
 import concurrent.futures
+import subprocess
+import toml
 from typing import Any, Dict, Optional, List, Tuple, Callable, Awaitable
 
 from core.dserver import run_server, reload_resolver, ResolverHolder
@@ -59,7 +61,7 @@ def main() -> None:
         except Exception as e:
             logging.warning("Failed to enable uvloop: %s", e)
 
-    # Extract typed configuration values (dns_resolver_server REMOVED)
+    # Extract typed configuration values
     disable_ipv6_flag: bool = bool(config.get("disable_ipv6", False))
     dns_cache_ttl_val: int = int(config.get("dns_cache_ttl", 300))
     dns_cache_max_size_val: int = int(config.get("dns_cache_max_size", 1024))
@@ -92,13 +94,34 @@ def main() -> None:
     pool_idle_timeout_val: float = float(config.get("pool_idle_timeout", 60.0))
     doh_version_val: str = str(config.get("doh_version", "auto"))
     doh_auto_cache_ttl_val: int = int(config.get("doh_auto_cache_ttl", 3600))
-
-    # NEW: Bootstrap configuration
     bootstrap_cfg: Dict[str, Any] = config.get("bootstrap", {})
     if not bootstrap_cfg:
         bootstrap_cfg = {'servers': [], 'timeout': 2.0, 'retries': 2}
 
-    # DHCP configuration
+    # ---- MITM configuration ----
+    mitm_cfg = config.get("mitm", {})
+    mitm_enabled = mitm_cfg.get("enabled", False)
+    mitm_socket_path = mitm_cfg.get("socket_path") if mitm_enabled else None
+
+    if mitm_enabled:
+        # Generate TOML config for the Rust MITM proxy
+        mitm_toml = {
+            'listen_addr': f"{mitm_cfg['listen_ip']}:{mitm_cfg['listen_port']}",
+            'ca_dir': mitm_cfg['ca_dir'],
+            'socket_path': mitm_cfg['socket_path'],
+            'cert_cache_ttl_secs': mitm_cfg['cert_cache_ttl'],
+            'ad_block_enabled': mitm_cfg['ad_block_enabled'],
+            'forward_non_doh': mitm_cfg['forward_non_doh'],
+        }
+        os.makedirs('/etc/phantomd', exist_ok=True)
+        with open('/etc/phantomd/mitm-config.toml', 'w') as f:
+            toml.dump(mitm_toml, f)
+        # Enable and restart the systemd service if it exists
+        subprocess.run(['systemctl', 'enable', 'phantomd-mitm'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(['systemctl', 'restart', 'phantomd-mitm'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        logging.info("MITM proxy enabled – Unix socket at %s", mitm_cfg['socket_path'])
+
+    # DHCP configuration (unchanged)
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
     dhcp_start_fn: Optional[Callable[[], Awaitable[None]]] = None
     if dhcp_cfg.get('enabled'):
@@ -215,7 +238,6 @@ def main() -> None:
             listen_port_cfg,
             upstream_dns,
             protocol,
-            # dns_resolver_server REMOVED
             verbose=verbose,
             blocklists=block_cfg or {},
             disable_ipv6=disable_ipv6_flag,
@@ -251,7 +273,8 @@ def main() -> None:
             pool_idle_timeout=pool_idle_timeout_val,
             doh_version=doh_version_val,
             doh_auto_cache_ttl=doh_auto_cache_ttl_val,
-            bootstrap=bootstrap_cfg,   # NEW
+            bootstrap=bootstrap_cfg,
+            mitm_socket_path=mitm_socket_path,
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None
@@ -267,7 +290,6 @@ def main() -> None:
                 holder: ResolverHolder = run_server.holder
                 resolver: DNSResolver = run_server.resolver
                 blocklists_cfg: Dict[str, Any] = new_config.get('blocklists', {})
-                # Pass the new bootstrap config to reload_resolver
                 asyncio.create_task(reload_resolver(holder, new_config, resolver, blocklists_cfg))
             except Exception as e:
                 logging.error("Configuration reload failed: %s", e)

@@ -214,7 +214,7 @@ async def reload_resolver(holder: ResolverHolder,
         pool_idle_timeout=config.get("pool_idle_timeout"),
         doh_version=config.get("doh_version"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl"),
-        bootstrap=config.get("bootstrap"),   # NEW
+        bootstrap=config.get("bootstrap"),
     )
 
     if blocklists:
@@ -273,8 +273,36 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
         logging.error('drop_privileges helper error: %s', e)
 
 
+# NEW: Unix socket handler for MITM proxy to forward DoH queries
+class DoHSocketHandler(asyncio.Protocol):
+    def __init__(self, resolver: DNSResolver):
+        self.resolver = resolver
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data: bytes):
+        asyncio.create_task(self._handle(data))
+
+    async def _handle(self, data: bytes):
+        # data format: 2-byte big-endian length + DNS wire
+        if len(data) < 2:
+            return
+        length = int.from_bytes(data[:2], 'big')
+        if len(data) < 2 + length:
+            return
+        dns_data = data[2:2+length]
+        try:
+            response = await self.resolver.forward_dns_query(dns_data)
+            resp_len = len(response).to_bytes(2, 'big')
+            self.transport.write(resp_len + response)
+        except Exception as e:
+            logging.error(f"DoHSocketHandler error: {e}")
+            self.transport.close()
+
+
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
-                     # dns_resolver_server REMOVED
                      verbose: bool = False,
                      blocklists: Optional[Dict[str, Any]] = None,
                      disable_ipv6: bool = False,
@@ -310,8 +338,9 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      pool_idle_timeout: float = 60.0,
                      doh_version: str = 'auto',
                      doh_auto_cache_ttl: int = 3600,
-                     bootstrap: Optional[Dict[str, Any]] = None) -> None:
-    """Start the DNS server (UDP + TCP) and blocklist background tasks."""
+                     bootstrap: Optional[Dict[str, Any]] = None,
+                     mitm_socket_path: Optional[str] = None) -> None:
+    """Start the DNS server (UDP + TCP) and optional MITM socket listener."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
@@ -345,7 +374,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         pool_idle_timeout=pool_idle_timeout,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
-        bootstrap=bootstrap,   # NEW
+        bootstrap=bootstrap,
     )
 
     holder = ResolverHolder(resolver)
@@ -404,6 +433,19 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         listen_ip, listen_port
     )
     logging.info(f"DNS TCP listener running on {listen_ip}:{listen_port}")
+
+    # --- Optional MITM socket listener ---
+    if mitm_socket_path:
+        try:
+            os.unlink(mitm_socket_path)
+        except FileNotFoundError:
+            pass
+        unix_server = await asyncio.start_unix_server(
+            lambda: DoHSocketHandler(resolver),
+            mitm_socket_path
+        )
+        logging.info(f"DoH forward socket listening on {mitm_socket_path}")
+        loop.create_task(unix_server.serve_forever())
 
     # --- Privilege dropping after binding ---
     if dns_privilege_drop_user:
