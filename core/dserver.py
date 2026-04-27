@@ -286,7 +286,6 @@ class DoHSocketHandler(asyncio.Protocol):
         asyncio.create_task(self._handle(data))
 
     async def _handle(self, data: bytes):
-        # data format: 2-byte big-endian length + DNS wire
         if len(data) < 2:
             return
         length = int.from_bytes(data[:2], 'big')
