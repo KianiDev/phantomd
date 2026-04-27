@@ -202,7 +202,7 @@ async def test_forward_https_called(resolver_mocked_forward):
     data = b'\xca\xfe\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03doh\x00\x00\x01\x00\x01'
     resp = await resolver_mocked_forward.forward_dns_query(data)
     resolver_mocked_forward._forward_https.assert_awaited_once_with(
-        data, {'address': '1.2.3.4', 'protocol': 'https', 'hostname': '1.2.3.4'}
+        data, {'address': '1.2.3.4', 'protocol': 'https', 'hostname': '1.2.3.4', 'path': ''}
     )
     assert resp == b'\x88\x88'
 
@@ -1010,3 +1010,202 @@ async def test_auto_doh_version_cache_expiry(resolver_doh_auto):
         # On cache miss, it probes again → probe + actual = 2 calls
         assert mock3.call_count == 2
         mock2.assert_not_called()
+
+
+# ===========================================================================
+# NEW: Bootstrap DNS tests
+# ===========================================================================
+
+@pytest.fixture
+def resolver_with_bootstrap():
+    resolver = DNSResolver(
+        upstream_dns="doh.example.com",
+        protocol="https",
+        disable_ipv6=True,
+        bootstrap={
+            'servers': ['1.1.1.1:53', '8.8.8.8:53'],
+            'timeout': 2.0,
+            'retries': 2,
+        },
+        cache_ttl=5,
+        cache_max_size=10,
+    )
+    resolver._udp_query_a_or_aaaa = AsyncMock(return_value='1.2.3.4')
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_resolves_hostname(resolver_with_bootstrap):
+    """Bootstrap server should be used to resolve upstream hostname."""
+    ip = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+    assert ip == '1.2.3.4'
+    resolver_with_bootstrap._udp_query_a_or_aaaa.assert_called_once()
+    # Check that it used the first bootstrap server
+    call_args = resolver_with_bootstrap._udp_query_a_or_aaaa.call_args[0]
+    assert call_args[0] == '1.1.1.1'  # resolver_ip
+    assert call_args[2] == 'doh.example.com'
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fallback_to_next_server(resolver_with_bootstrap):
+    """If first bootstrap server fails, try the next."""
+    # First call fails, second succeeds
+    resolver_with_bootstrap._udp_query_a_or_aaaa = AsyncMock(side_effect=[
+        Exception("timeout"),
+        '5.6.7.8'
+    ])
+    ip = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+    assert ip == '5.6.7.8'
+    assert resolver_with_bootstrap._udp_query_a_or_aaaa.call_count == 2
+    # Check it tried both servers
+    first_call = resolver_with_bootstrap._udp_query_a_or_aaaa.call_args_list[0][0]
+    second_call = resolver_with_bootstrap._udp_query_a_or_aaaa.call_args_list[1][0]
+    assert first_call[0] == '1.1.1.1'
+    assert second_call[0] == '8.8.8.8'
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fallback_to_system_resolver(resolver_with_bootstrap):
+    """If all bootstrap servers fail, fall back to system resolver."""
+    resolver_with_bootstrap._udp_query_a_or_aaaa = AsyncMock(side_effect=[
+        Exception("fail1"),
+        Exception("fail2"),
+    ])
+    # Mock system getaddrinfo
+    with patch('asyncio.get_running_loop') as mock_loop:
+        mock_loop.return_value.getaddrinfo = AsyncMock(return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('2.2.2.2', 0))
+        ])
+        ip = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+        assert ip == '2.2.2.2'
+        assert resolver_with_bootstrap._udp_query_a_or_aaaa.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cache(resolver_with_bootstrap):
+    """Resolved IP should be cached."""
+    ip1 = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+    assert ip1 == '1.2.3.4'
+    resolver_with_bootstrap._udp_query_a_or_aaaa.reset_mock()
+    ip2 = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+    assert ip2 == '1.2.3.4'
+    resolver_with_bootstrap._udp_query_a_or_aaaa.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_no_servers_fallback_to_system(resolver_with_bootstrap):
+    """If bootstrap_servers is empty, directly use system resolver."""
+    resolver_with_bootstrap.bootstrap_servers = []
+    with patch('asyncio.get_running_loop') as mock_loop:
+        mock_loop.return_value.getaddrinfo = AsyncMock(return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('3.3.3.3', 0))
+        ])
+        ip = await resolver_with_bootstrap._resolve_upstream_ip("doh.example.com")
+        assert ip == '3.3.3.3'
+        resolver_with_bootstrap._udp_query_a_or_aaaa.assert_not_called()
+
+
+# ===========================================================================
+# NEW: Custom DoH path tests
+# ===========================================================================
+
+@pytest.fixture
+def resolver_custom_path():
+    resolver = DNSResolver(
+        upstream_dns="doh.example.com",
+        protocol="https",
+        disable_ipv6=True,
+        doh_version="1.1",
+    )
+    resolver._resolve_upstream_ip = AsyncMock(return_value="1.1.1.1")
+    resolver._forward_https1 = AsyncMock(return_value=b'response')
+    resolver._forward_https2 = AsyncMock(return_value=b'response')
+    resolver._forward_https3 = AsyncMock(return_value=b'response')
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_custom_path_https1(resolver_custom_path):
+    upstream = {
+        'address': 'doh.example.com',
+        'protocol': 'https',
+        'port': 443,
+        'hostname': 'doh.example.com',
+        'path': '/custom/dns-query',
+        'doh_version': '1.1',
+    }
+    await resolver_custom_path._forward_https(b'data', upstream)
+    resolver_custom_path._forward_https1.assert_called_once_with(
+        b'data', 'doh.example.com', 443, 'doh.example.com', '/custom/dns-query'
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_path_https2(resolver_custom_path):
+    upstream = {
+        'address': 'doh.example.com',
+        'protocol': 'https',
+        'port': 443,
+        'hostname': 'doh.example.com',
+        'path': '/x/y/dns-query',
+        'doh_version': '2',
+    }
+    await resolver_custom_path._forward_https(b'data', upstream)
+    resolver_custom_path._forward_https2.assert_called_once_with(
+        b'data', 'doh.example.com', 443, 'doh.example.com', '/x/y/dns-query'
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_path_https3(resolver_custom_path):
+    if not _HAS_AIOQUIC:
+        pytest.skip("aioquic not available")
+    upstream = {
+        'address': 'doh.example.com',
+        'protocol': 'https',
+        'port': 443,
+        'hostname': 'doh.example.com',
+        'path': '/dns-query/custom',
+        'doh_version': '3',
+    }
+    await resolver_custom_path._forward_https(b'data', upstream)
+    resolver_custom_path._forward_https3.assert_called_once_with(
+        b'data', 'doh.example.com', 443, 'doh.example.com', '/dns-query/custom'
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_path_default_when_missing(resolver_custom_path):
+    upstream = {
+        'address': 'doh.example.com',
+        'protocol': 'https',
+        'port': 443,
+        'hostname': 'doh.example.com',
+        'doh_version': '1.1',
+        # no 'path' key
+    }
+    await resolver_custom_path._forward_https(b'data', upstream)
+    resolver_custom_path._forward_https1.assert_called_once_with(
+        b'data', 'doh.example.com', 443, 'doh.example.com', '/dns-query'
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_path_in_upstream_list(resolver_pooled_https2):
+    """Integration: upstream list includes custom path and is used correctly."""
+    resolver_pooled_https2.upstreams = [
+        {'address': 'custom.doh.com', 'protocol': 'https', 'port': 443,
+         'hostname': 'custom.doh.com', 'path': '/v1/dns-query', 'doh_version': '2'}
+    ]
+    resolver_pooled_https2.protocol = "https"
+    resolver_pooled_https2._forward_https2 = AsyncMock(return_value=b'ok')
+    resolver_pooled_https2._resolve_upstream_ip = AsyncMock(return_value='1.1.1.1')
+
+    data = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03test\x00\x00\x01\x00\x01'
+    await resolver_pooled_https2.forward_dns_query(data)
+    resolver_pooled_https2._forward_https2.assert_called_once()
+    # _forward_https2 is called with (data, hostname, port, host, path)
+    args, kwargs = resolver_pooled_https2._forward_https2.call_args
+    # The fifth argument (index 4) is the path
+    assert len(args) >= 5
+    assert args[4] == '/v1/dns-query'  # path

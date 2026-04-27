@@ -214,6 +214,7 @@ async def reload_resolver(holder: ResolverHolder,
         pool_idle_timeout=config.get("pool_idle_timeout"),
         doh_version=config.get("doh_version"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl"),
+        bootstrap=config.get("bootstrap"),   # NEW
     )
 
     if blocklists:
@@ -273,7 +274,7 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
 
 
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
-                     dns_resolver_server: Optional[str] = None,
+                     # dns_resolver_server REMOVED
                      verbose: bool = False,
                      blocklists: Optional[Dict[str, Any]] = None,
                      disable_ipv6: bool = False,
@@ -308,14 +309,14 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      pool_max_size: int = 5,
                      pool_idle_timeout: float = 60.0,
                      doh_version: str = 'auto',
-                     doh_auto_cache_ttl: int = 3600) -> None:
+                     doh_auto_cache_ttl: int = 3600,
+                     bootstrap: Optional[Dict[str, Any]] = None) -> None:
     """Start the DNS server (UDP + TCP) and blocklist background tasks."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
         upstream_dns=upstream_dns,
         protocol=protocol,
-        dns_resolver_server=dns_resolver_server,
         verbose=verbose,
         disable_ipv6=disable_ipv6,
         cache_ttl=dns_cache_ttl,
@@ -344,6 +345,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         pool_idle_timeout=pool_idle_timeout,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
+        bootstrap=bootstrap,   # NEW
     )
 
     holder = ResolverHolder(resolver)
@@ -424,7 +426,6 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
 
 
 def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
-                    dns_resolver_server: Optional[str] = None,
                     verbose: bool = False,
                     blocklists: Optional[Dict[str, Any]] = None,
                     disable_ipv6: bool = False,
@@ -432,7 +433,6 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
     """Synchronous wrapper for run_server."""
     asyncio.run(run_server(
         listen_ip, listen_port, upstream_dns, protocol,
-        dns_resolver_server=dns_resolver_server,
         verbose=verbose,
         blocklists=blocklists,
         disable_ipv6=disable_ipv6,

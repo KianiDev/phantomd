@@ -28,7 +28,6 @@ def resolver_no_network():
     return DNSResolver(
         upstream_dns="1.1.1.1",
         protocol="udp",
-        dns_resolver_server=None,
         verbose=False,
         disable_ipv6=True,
         cache_ttl=5,
@@ -145,7 +144,6 @@ def _probe_server(address: tuple) -> bool:
     is received."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Bind to a different IP than the test queries will use
         s.bind(('127.0.0.2', 0))
         s.settimeout(0.5)
         q = dns.message.make_query('probe.invalid', 'A').to_wire()

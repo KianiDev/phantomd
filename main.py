@@ -59,8 +59,7 @@ def main() -> None:
         except Exception as e:
             logging.warning("Failed to enable uvloop: %s", e)
 
-    # Extract typed configuration values
-    dns_resolver_server: str = str(config.get("dns_resolver_server") or "")
+    # Extract typed configuration values (dns_resolver_server REMOVED)
     disable_ipv6_flag: bool = bool(config.get("disable_ipv6", False))
     dns_cache_ttl_val: int = int(config.get("dns_cache_ttl", 300))
     dns_cache_max_size_val: int = int(config.get("dns_cache_max_size", 1024))
@@ -91,10 +90,13 @@ def main() -> None:
     dns_rebind_action_val: str = str(config.get("dns_rebind_action", "strip"))
     pool_max_size_val: int = int(config.get("pool_max_size", 5))
     pool_idle_timeout_val: float = float(config.get("pool_idle_timeout", 60.0))
-
-    # NEW: DoH version configuration
     doh_version_val: str = str(config.get("doh_version", "auto"))
     doh_auto_cache_ttl_val: int = int(config.get("doh_auto_cache_ttl", 3600))
+
+    # NEW: Bootstrap configuration
+    bootstrap_cfg: Dict[str, Any] = config.get("bootstrap", {})
+    if not bootstrap_cfg:
+        bootstrap_cfg = {'servers': [], 'timeout': 2.0, 'retries': 2}
 
     # DHCP configuration
     dhcp_cfg: Dict[str, Any] = config.get('dhcp', {})
@@ -213,7 +215,7 @@ def main() -> None:
             listen_port_cfg,
             upstream_dns,
             protocol,
-            dns_resolver_server=dns_resolver_server,
+            # dns_resolver_server REMOVED
             verbose=verbose,
             blocklists=block_cfg or {},
             disable_ipv6=disable_ipv6_flag,
@@ -249,6 +251,7 @@ def main() -> None:
             pool_idle_timeout=pool_idle_timeout_val,
             doh_version=doh_version_val,
             doh_auto_cache_ttl=doh_auto_cache_ttl_val,
+            bootstrap=bootstrap_cfg,   # NEW
         ))
 
         dhcp_task: Optional[asyncio.Task[Any]] = None
@@ -264,6 +267,7 @@ def main() -> None:
                 holder: ResolverHolder = run_server.holder
                 resolver: DNSResolver = run_server.resolver
                 blocklists_cfg: Dict[str, Any] = new_config.get('blocklists', {})
+                # Pass the new bootstrap config to reload_resolver
                 asyncio.create_task(reload_resolver(holder, new_config, resolver, blocklists_cfg))
             except Exception as e:
                 logging.error("Configuration reload failed: %s", e)

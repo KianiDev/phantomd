@@ -268,6 +268,7 @@ class DNSResolver:
       - Optimistic caching (serve-stale per RFC 8767)
       - DNS rebinding protection (strip or block private IPs)
       - Connection pooling for TCP, TLS, HTTP/2, HTTP/3, and DoQ
+      - Bootstrap DNS servers for upstream hostname resolution
 
     Logging:
       The resolver emits DEBUG logs for cache hits/misses, request lifecycle,
@@ -277,7 +278,7 @@ class DNSResolver:
     def __init__(self,
                   upstream_dns: str,
                   protocol: str = "udp",
-                  dns_resolver_server: Optional[str] = None,
+                  # dns_resolver_server REMOVED
                   verbose: bool = False,
                   disable_ipv6: bool = False,
                   cache_ttl: int = 300,
@@ -305,14 +306,21 @@ class DNSResolver:
                   pool_max_size: int = 5,
                   pool_idle_timeout: float = 60.0,
                   doh_version: str = 'auto',
-                  doh_auto_cache_ttl: int = 3600) -> None:
+                  doh_auto_cache_ttl: int = 3600,
+                  bootstrap: Optional[Dict[str, Any]] = None) -> None:
         # --- single upstream fallback ---
         self.upstream_dns: str = upstream_dns
         self.protocol: str = protocol.lower()
         # --- multi-upstream list (optional) ---
         self.upstreams: List[Dict[str, Any]] = upstreams or []
 
-        self.dns_resolver_server: Optional[str] = dns_resolver_server
+        # --- bootstrap DNS servers ---
+        if bootstrap is None:
+            bootstrap = {}
+        self.bootstrap_servers: List[str] = bootstrap.get('servers', [])
+        self.bootstrap_timeout: float = bootstrap.get('timeout', 2.0)
+        self.bootstrap_retries: int = bootstrap.get('retries', 2)
+
         self.disable_ipv6: bool = bool(disable_ipv6)
         self.verbose: bool = bool(verbose)
         self.logger: logging.Logger = logging.getLogger("phantomd.DNSResolver")
@@ -401,8 +409,6 @@ class DNSResolver:
         self.rate_limit_rps: float = rate_limit_rps
         self.rate_limit_burst: float = rate_limit_burst
         if rate_limit_rps > 0:
-            # A burst of 0 still needs at least 1 initial token so the first
-            # request isn't blocked immediately.
             effective_burst = max(1.0, rate_limit_burst)
             self.rate_limiter: Optional[RateLimiter] = RateLimiter(rate_limit_rps, effective_burst)
         else:
@@ -971,6 +977,108 @@ class DNSResolver:
             raise
         self.logger.debug("DNSSEC validation passed for %s", qname)
 
+    # --- Bootstrap DNS resolution (replaces old dns_resolver_server logic) ---
+    async def _resolve_upstream_ip(self, hostname: str) -> str:
+        key = (hostname, bool(self.disable_ipv6))
+        cached = await self._cache_get(key)
+        if cached:
+            self.logger.debug("resolved %s from cache -> %s", hostname, cached)
+            return cached
+
+        self.logger.debug("resolving upstream hostname: %s", hostname)
+
+        # Try bootstrap DNS servers if configured
+        if self.bootstrap_servers:
+            for bs in self.bootstrap_servers:
+                try:
+                    ip, port = self._split_hostport(bs, default_port=53)
+                    addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=1)
+                    if not addr:
+                        addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=28)
+                    if addr:
+                        await self._cache_set(key, addr)
+                        self.logger.debug("bootstrap server %s returned %s for %s", bs, addr, hostname)
+                        return addr
+                except Exception as e:
+                    self.logger.debug("bootstrap server %s failed: %s", bs, e)
+                    continue
+
+        # Fallback to system resolver
+        try:
+            family = socket.AF_INET if self.disable_ipv6 else 0
+            infos = await asyncio.get_running_loop().getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM)
+            for info in infos:
+                addr = info[4][0]
+                if addr:
+                    await self._cache_set(key, addr)
+                    self.logger.debug("system resolver returned %s for %s", addr, hostname)
+                    return addr
+        except Exception as e:
+            self.logger.debug("system resolver failed for %s: %s", hostname, e)
+
+        self.logger.error("unable to resolve upstream hostname: %s", hostname)
+        raise Exception(f"Unable to resolve upstream hostname: {hostname}")
+
+    async def _udp_query_a_or_aaaa(self, resolver_ip: str, resolver_port: int, qname: str, qtype: int = 1) -> Optional[str]:
+        self.logger.debug("udp lookup of %s via %s:%d", qname, resolver_ip, resolver_port)
+        loop = asyncio.get_running_loop()
+        try:
+            ip_obj = ipaddress.ip_address(resolver_ip)
+            fam = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
+        except Exception:
+            fam = socket.AF_INET
+        sock = socket.socket(fam, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        try:
+            tid = int(time.time() * 1000) & 0xFFFF
+            header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+            q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in qname.split("."))
+            q += b"\x00" + struct.pack(">HH", int(qtype), 1)
+            query = header + q
+            addr_tuple = (resolver_ip, resolver_port) if fam == socket.AF_INET else (resolver_ip, resolver_port, 0, 0)
+            await loop.sock_sendto(sock, query, addr_tuple)
+            try:
+                data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 4096), timeout=self.udp_timeout)
+            except asyncio.TimeoutError:
+                self.logger.debug("udp lookup timed out for %s (qtype=%s)", qname, qtype)
+                return None
+
+            if len(data) < 12:
+                raise Exception("short DNS response")
+            qdcount = (data[4] << 8) | data[5]
+            ancount = (data[6] << 8) | data[7]
+            i = 12
+            for _ in range(qdcount):
+                _, i = self._parse_dns_name(data, i)
+                i += 4
+            a_addr: Optional[str] = None
+            aaaa_addr: Optional[str] = None
+            for _ in range(ancount):
+                _, i = self._parse_dns_name(data, i)
+                if i + 10 > len(data):
+                    raise Exception("truncated answer header")
+                rtype = (data[i] << 8) | data[i+1]
+                ttl = struct.unpack(">I", data[i+4:i+8])[0]
+                rdlen = (data[i+8] << 8) | data[i+9]
+                if i + 10 + rdlen > len(data):
+                    raise Exception("truncated rdata")
+                rdata = data[i+10:i+10+rdlen]
+                i += 10 + rdlen
+                if rtype == 1 and rdlen == 4:
+                    a_addr = ".".join(str(b) for b in rdata)
+                elif rtype == 28 and rdlen == 16:
+                    try:
+                        aaaa_addr = socket.inet_ntop(socket.AF_INET6, bytes(rdata))
+                    except Exception:
+                        aaaa_addr = ":".join("{:02x}{:02x}".format(rdata[j], rdata[j+1]) for j in range(0, 16, 2))
+            if qtype == 1:
+                return a_addr
+            if qtype == 28:
+                return aaaa_addr
+            return a_addr or aaaa_addr
+        finally:
+            sock.close()
+
     # --- New: try an upstream and return response or raise ---
     async def _try_upstream(self, upstream: Dict[str, Any], data: bytes) -> bytes:
         proto = upstream.get('protocol', 'udp')
@@ -1030,10 +1138,14 @@ class DNSResolver:
                 cached = self._apply_rebind_protection(cached)
             return cached
 
-        # --- prepare upstream list ---
+        # --- prepare upstream list (merge path for DoH) ---
         upstream_list = self.upstreams if self.upstreams else [
             {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
         ]
+        # For each upstream, if protocol is https and it has a custom path, attach it
+        for up in upstream_list:
+            if up.get('protocol') == 'https' and 'path' not in up:
+                up['path'] = ''  # will default in forward methods
 
         last_exc = None
         for upstream in upstream_list:
@@ -1065,7 +1177,7 @@ class DNSResolver:
         self.logger.error("all upstreams failed")
         raise last_exc or Exception("All upstreams exhausted")
 
-    # --- forwarding implementations (with connection pooling) ---
+    # --- forwarding implementations (with connection pooling and path support) ---
 
     async def _forward_udp(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
@@ -1173,8 +1285,7 @@ class DNSResolver:
             writer.close()
             raise
 
-    # --- DoH implementation (HTTP/1.1, HTTP/2, HTTP/3, auto) ---
-
+    # --- DoH implementation with custom path support ---
     async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
             host = self.upstream_dns
@@ -1186,7 +1297,9 @@ class DNSResolver:
             host = upstream['address']
             port = upstream.get('port', 443)
             hostname = upstream.get('hostname', host)
-            path = upstream.get('path', '/dns-query')
+            path = upstream.get('path', '')
+            if not path:
+                path = "/dns-query"
             version = upstream.get('doh_version', self.doh_version)
 
         if version == 'auto':
@@ -1323,14 +1436,13 @@ class DNSResolver:
             writer.close()
             await writer.wait_closed()
 
-    # ---------- DoH/2 (HTTP/2) with pooling ----------
     async def _forward_https2(self, data: bytes, hostname: str, port: int, host: str, path: str) -> bytes:
         try:
             import httpx
         except ImportError:
             raise RuntimeError("httpx is required for HTTP/2 DoH (install with: pip install httpx[h2])")
 
-        key = (hostname, port)
+        key = (hostname, port, path)  # include path in key for different paths
         client: Optional[httpx.AsyncClient] = await self._h2_pool.get(key)
         if client is None:
             client = httpx.AsyncClient(http2=True, verify=ssl.create_default_context())
@@ -1359,7 +1471,6 @@ class DNSResolver:
                 pass
             raise
 
-    # ---------- DoH/3 (HTTP/3) with pooling ----------
     async def _forward_https3(self, data: bytes, hostname: str, port: int, host: str, path: str) -> bytes:
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic is required for HTTP/3 DoH (install with: pip install aioquic)")
@@ -1374,7 +1485,7 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        key = (hostname, port)
+        key = (hostname, port, path)
         ctx = await self._h3_pool.get(key)
         if ctx is not None:
             connection, h3 = ctx
@@ -1478,7 +1589,7 @@ class DNSResolver:
             await self._h3_pool.put(key, (connection, h3))
             return bytes(response_data)
 
-    # ---------- DoQ with pooling ----------
+    # --- DoQ with custom path? DoQ doesn't use path, but we keep it for consistency ---
     async def _forward_quic(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic not available for DoQ")
@@ -1610,7 +1721,7 @@ class DNSResolver:
             pass
         return None
 
-    # --- name resolution helpers ---
+    # --- name resolution helpers (kept) ---
     def _split_hostport(self, hostport: str, default_port: int = 53) -> Tuple[str, int]:
         if not hostport:
             return "", default_port
@@ -1648,107 +1759,6 @@ class DNSResolver:
             self._der = der
         def getpeercert(self, binary_form: bool = False) -> Optional[bytes]:
             return self._der if binary_form else None
-
-    async def _resolve_upstream_ip(self, hostname: str) -> str:
-        key = (hostname, bool(self.disable_ipv6))
-        cached = await self._cache_get(key)
-        if cached:
-            self.logger.debug("resolved %s from cache -> %s", hostname, cached)
-            return cached
-
-        self.logger.debug("resolving upstream hostname: %s", hostname)
-        try:
-            family = socket.AF_INET if self.disable_ipv6 else 0
-            infos = await asyncio.get_running_loop().getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM)
-            for info in infos:
-                addr = info[4][0]
-                if addr:
-                    await self._cache_set(key, addr)
-                    self.logger.debug("system resolver returned %s for %s", addr, hostname)
-                    return addr
-        except Exception as e:
-            self.logger.debug("system resolver failed for %s: %s", hostname, e)
-
-        if self.dns_resolver_server:
-            self.logger.debug("falling back to configured dns_resolver_server: %s", self.dns_resolver_server)
-            try:
-                parts = self.dns_resolver_server.rsplit(":", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    ip, port = parts[0], int(parts[1])
-                else:
-                    ip, port = parts[0], 53
-                addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=1)
-                if not addr:
-                    addr = await self._udp_query_a_or_aaaa(ip, port, hostname, qtype=28)
-                if addr:
-                    await self._cache_set(key, addr)
-                    self.logger.debug("resolver server returned %s for %s", addr, hostname)
-                    return addr
-            except Exception as e:
-                self.logger.debug("dns_resolver_server lookup failed for %s: %s", hostname, e)
-
-        self.logger.error("unable to resolve upstream hostname: %s", hostname)
-        raise Exception(f"Unable to resolve upstream hostname: {hostname}")
-
-    async def _udp_query_a_or_aaaa(self, resolver_ip: str, resolver_port: int, qname: str, qtype: int = 1) -> Optional[str]:
-        self.logger.debug("udp lookup of %s via %s:%d", qname, resolver_ip, resolver_port)
-        loop = asyncio.get_running_loop()
-        try:
-            ip_obj = ipaddress.ip_address(resolver_ip)
-            fam = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
-        except Exception:
-            fam = socket.AF_INET
-        sock = socket.socket(fam, socket.SOCK_DGRAM)
-        sock.setblocking(False)
-        try:
-            tid = int(time.time() * 1000) & 0xFFFF
-            header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
-            q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in qname.split("."))
-            q += b"\x00" + struct.pack(">HH", int(qtype), 1)
-            query = header + q
-            addr_tuple = (resolver_ip, resolver_port) if fam == socket.AF_INET else (resolver_ip, resolver_port, 0, 0)
-            await loop.sock_sendto(sock, query, addr_tuple)
-            try:
-                data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 4096), timeout=self.udp_timeout)
-            except asyncio.TimeoutError:
-                self.logger.debug("udp lookup timed out for %s (qtype=%s)", qname, qtype)
-                return None
-
-            if len(data) < 12:
-                raise Exception("short DNS response")
-            qdcount = (data[4] << 8) | data[5]
-            ancount = (data[6] << 8) | data[7]
-            i = 12
-            for _ in range(qdcount):
-                _, i = self._parse_dns_name(data, i)
-                i += 4
-            a_addr: Optional[str] = None
-            aaaa_addr: Optional[str] = None
-            for _ in range(ancount):
-                _, i = self._parse_dns_name(data, i)
-                if i + 10 > len(data):
-                    raise Exception("truncated answer header")
-                rtype = (data[i] << 8) | data[i+1]
-                ttl = struct.unpack(">I", data[i+4:i+8])[0]
-                rdlen = (data[i+8] << 8) | data[i+9]
-                if i + 10 + rdlen > len(data):
-                    raise Exception("truncated rdata")
-                rdata = data[i+10:i+10+rdlen]
-                i += 10 + rdlen
-                if rtype == 1 and rdlen == 4:
-                    a_addr = ".".join(str(b) for b in rdata)
-                elif rtype == 28 and rdlen == 16:
-                    try:
-                        aaaa_addr = socket.inet_ntop(socket.AF_INET6, bytes(rdata))
-                    except Exception:
-                        aaaa_addr = ":".join("{:02x}{:02x}".format(rdata[j], rdata[j+1]) for j in range(0, 16, 2))
-            if qtype == 1:
-                return a_addr
-            if qtype == 28:
-                return aaaa_addr
-            return a_addr or aaaa_addr
-        finally:
-            sock.close()
 
     # ---------- block action helpers ----------
     def set_block_action(self, action: Optional[str]) -> None:
@@ -1874,7 +1884,7 @@ class DNSResolver:
         except Exception:
             return self._make_nxdomain_response(request_data)
 
-    # --- NEW: DNS rebinding protection ---
+    # --- DNS rebinding protection ---
     @staticmethod
     def _is_private_ip(ip_str: str) -> bool:
         try:
@@ -1954,7 +1964,8 @@ class DNSResolver:
                       pool_max_size: Optional[int] = None,
                       pool_idle_timeout: Optional[float] = None,
                       doh_version: Optional[str] = None,
-                      doh_auto_cache_ttl: Optional[int] = None) -> None:
+                      doh_auto_cache_ttl: Optional[int] = None,
+                      bootstrap: Optional[Dict[str, Any]] = None) -> None:
         """Hot‑update resolver settings without recreating the object."""
         if upstream_dns is not None:
             self.upstream_dns = upstream_dns
@@ -2029,13 +2040,17 @@ class DNSResolver:
             self.doh_version = doh_version
         if doh_auto_cache_ttl is not None:
             self.doh_auto_cache_ttl = doh_auto_cache_ttl
+        if bootstrap is not None:
+            self.bootstrap_servers = bootstrap.get('servers', [])
+            self.bootstrap_timeout = bootstrap.get('timeout', 2.0)
+            self.bootstrap_retries = bootstrap.get('retries', 2)
 
         self.logger.info("DNSResolver configuration updated: upstream=%s, protocol=%s, "
                          "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
-                         "rebind_protection=%s/%s, doh_version=%s",
+                         "rebind_protection=%s/%s, doh_version=%s, bootstrap_servers=%s",
                          self.upstream_dns, self.protocol,
                          self.disable_ipv6, self.verbose,
                          self.rate_limit_rps, self.rate_limit_burst,
                          self.optimistic_cache_enabled,
                          self.rebind_protection_enabled, self.rebind_action,
-                         self.doh_version)
+                         self.doh_version, self.bootstrap_servers)

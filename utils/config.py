@@ -17,14 +17,13 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     if not os.path.exists(path):
         # Return a full set of defaults when no config file is present.
         # This ensures all expected keys are available with safe values.
-        return {
+        default = {
             'verbose': False,
             'listen_ip': '0.0.0.0',
             'listen_port': 53,
             'listen_loopback_only': False,
             'upstream_dns': '1.1.1.1',
             'protocol': 'udp',
-            'dns_resolver_server': '1.1.1.1:53',
             'disable_ipv6': False,
             'blocklists': {
                 'enabled': False,
@@ -87,10 +86,16 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
             'dns_rebind_action': 'strip',
             'pool_max_size': 5,
             'pool_idle_timeout': 60.0,
-            # DoH version – default "auto" to probe the best protocol
             'doh_version': 'auto',
             'doh_auto_cache_ttl': 3600,
+            # NEW bootstrap section defaults
+            'bootstrap': {
+                'servers': ['1.1.1.1:53', '8.8.8.8:53'],
+                'timeout': 2.0,
+                'retries': 2,
+            }
         }
+        return default
     config.read(path)
 
     # read blocklists section
@@ -158,7 +163,6 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     dhcp_lease_db: str = config.get('dhcp', 'dhcp_lease_db', fallback='/var/lib/phantomd/dhcp_leases.json')
 
     # Security and advanced options
-    dns_resolver_server: str = config.get('upstream', 'dns_resolver_server', fallback='1.1.1.1:53')
     dnssec_enabled: bool = config.getboolean('upstream', 'dnssec_enabled', fallback=False)
     trust_anchors_file: str = config.get('upstream', 'trust_anchors_file', fallback='')
     pinned_raw: str = config.get('upstream', 'pinned_certs', fallback='')
@@ -208,13 +212,28 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
     pool_max_size: int = config.getint('advanced', 'pool_max_size', fallback=5)
     pool_idle_timeout: float = config.getfloat('advanced', 'pool_idle_timeout', fallback=60.0)
 
-    # NEW: DoH version options
+    # DoH version options
     doh_version: str = config.get('advanced', 'doh_version', fallback='auto').strip().lower()
     if doh_version not in ('auto', '1.1', '2', '3'):
         doh_version = 'auto'
     doh_auto_cache_ttl: int = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
 
-    # --- Multi-upstream parsing ---
+    # --- Bootstrap section (NEW) ---
+    bootstrap_servers_raw: str = config.get('bootstrap', 'servers', fallback='')
+    if bootstrap_servers_raw.strip():
+        bootstrap_servers = [s.strip() for s in bootstrap_servers_raw.split(',') if s.strip()]
+    else:
+        bootstrap_servers = []
+    bootstrap_timeout: float = config.getfloat('bootstrap', 'timeout', fallback=2.0)
+    bootstrap_retries: int = config.getint('bootstrap', 'retries', fallback=2)
+
+    bootstrap = {
+        'servers': bootstrap_servers,
+        'timeout': bootstrap_timeout,
+        'retries': bootstrap_retries,
+    }
+
+    # --- Multi-upstream parsing (with path support) ---
     upstreams: List[Dict[str, Any]] = []
     if config.has_section('upstreams') and config.has_option('upstreams', 'servers'):
         server_names = [s.strip() for s in config.get('upstreams', 'servers').split(',') if s.strip()]
@@ -243,6 +262,8 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 else:
                     port = 53
             hostname = config.get(section, 'hostname', fallback='') or address
+            # New: path for DoH
+            path = config.get(section, 'path', fallback='')
             # optional per-upstream doh_version
             us_doh_version = config.get(section, 'doh_version', fallback=doh_version).lower()
             if us_doh_version not in ('auto', '1.1', '2', '3'):
@@ -253,6 +274,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
                 'port': port,
                 'hostname': hostname,
                 'doh_version': us_doh_version,
+                'path': path,          # NEW field
             })
 
     return {
@@ -262,7 +284,7 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'listen_loopback_only': listen_loopback_only,
         'upstream_dns': config.get('upstream', 'dns_server', fallback='1.1.1.1'),
         'protocol': config.get('upstream', 'dns_protocol', fallback='udp'),
-        'dns_resolver_server': dns_resolver_server,
+        # removed dns_resolver_server
         'disable_ipv6': disable_ipv6,
         'blocklists': {
             'enabled': block_enabled,
@@ -327,4 +349,5 @@ def load_config(path: str = 'config/phantomd.conf') -> Dict[str, Any]:
         'pool_idle_timeout': pool_idle_timeout,
         'doh_version': doh_version,
         'doh_auto_cache_ttl': doh_auto_cache_ttl,
+        'bootstrap': bootstrap,   # NEW
     }
