@@ -1,14 +1,10 @@
 import sys
 import os
 
-
-# ------------------------------------------------------------
-# 1. Add the project root to sys.path FIRST
-# ------------------------------------------------------------
+# add project root to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
 
 import asyncio
 import socket
@@ -21,10 +17,8 @@ import dns.rrset
 from core.resolver import DNSResolver
 from core.phantomd_dhcp import DHCPServer
 
-
 @pytest.fixture
 def resolver_no_network():
-    """Return a DNSResolver with no real upstream; suitable for cache/parsing tests."""
     return DNSResolver(
         upstream_dns="1.1.1.1",
         protocol="udp",
@@ -34,10 +28,8 @@ def resolver_no_network():
         cache_max_size=10,
     )
 
-
 @pytest.fixture
 def dhcp_server():
-    """Create a DHCPServer with a small pool and no persistence for unit tests."""
     srv = DHCPServer(
         subnet="192.168.1.0",
         netmask="255.255.255.0",
@@ -52,21 +44,17 @@ def dhcp_server():
     srv._maybe_async_save = lambda: None
     return srv
 
-
 # ---------------------------------------------------------------------------
 # Integration test fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def unused_port() -> int:
-    """Return a random, available high port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-
 class MockUpstream:
-    """A minimal DNS server that responds with canned answers for integration tests."""
     def __init__(self, answers_by_qname=None, failures: int = 0):
         self.answers_by_qname = answers_by_qname or {}
         self.failures = failures
@@ -110,7 +98,6 @@ class MockUpstream:
         if self.transport:
             self.transport.close()
 
-
 class MockUpstreamProtocol(asyncio.DatagramProtocol):
     def __init__(self, handler: MockUpstream):
         self.handler = handler
@@ -121,14 +108,13 @@ class MockUpstreamProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         self.handler.handle(data, addr)
 
-
-async def _wait_for_server(host: str, port: int, timeout: float = 5.0) -> None:
+async def _wait_for_server(host: str, port: int, timeout: float = 3.0) -> None:
     """Wait until the TCP server is accepting connections."""
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=0.1
+                asyncio.open_connection(host, port), timeout=0.2
             )
             writer.close()
             return
@@ -137,24 +123,21 @@ async def _wait_for_server(host: str, port: int, timeout: float = 5.0) -> None:
                 raise Exception("Server did not start within timeout")
             await asyncio.sleep(0.05)
 
-
-def _probe_server(address: tuple) -> bool:
-    """Send a single UDP probe query from a different source IP so that
-    it does NOT affect rate‑limiter buckets.  Returns True if any response
-    is received."""
+def _probe_udp(address: tuple) -> bool:
+    """Send a single DNS query over UDP and wait for any response (timeout 0.2s)."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(('127.0.0.2', 0))
-        s.settimeout(0.5)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        # Use a random source port
+        sock.bind(('127.0.0.1', 0))
         q = dns.message.make_query('probe.invalid', 'A').to_wire()
-        s.sendto(q, address)
-        data, _ = s.recvfrom(512)
+        sock.sendto(q, address)
+        data, _ = sock.recvfrom(512)
         return data is not None
     except (socket.timeout, OSError):
         return False
     finally:
-        s.close()
-
+        sock.close()
 
 @pytest_asyncio.fixture
 async def phantomd_server_factory():
@@ -202,7 +185,6 @@ async def phantomd_server_factory():
         # Build upstream(s)
         upstreams = cfg.get('upstreams', [])
         if not upstreams:
-            # Single mock upstream if none given
             mu = MockUpstream(answers_by_qname={'example.com.': '1.2.3.4'})
             upstream_port = await mu.start()
             mock_upstreams.append(mu)
@@ -248,26 +230,23 @@ async def phantomd_server_factory():
             pool_max_size=config.get('pool_max_size', 1),
             pool_idle_timeout=config.get('pool_idle_timeout', 60.0),
         ))
-
         tasks.append(task)
-        await _wait_for_server(config['listen_ip'], config['listen_port'])
 
-        # --- Non‑blocking UDP readiness probe (from 127.0.0.2) ---
+        # Wait for TCP server to be ready
+        await _wait_for_server(config['listen_ip'], config['listen_port'], timeout=3.0)
+
+        # Probe UDP server with short timeout
         loop = asyncio.get_running_loop()
         addr = (config['listen_ip'], config['listen_port'])
-        deadline = loop.time() + 5.0
-        udp_ready = False
-        while loop.time() < deadline:
-            ok = await loop.run_in_executor(None, _probe_server, addr)
-            if ok:
-                udp_ready = True
-                break
-            await asyncio.sleep(0.2)
+        udp_ready = await loop.run_in_executor(None, _probe_udp, addr)
         if not udp_ready:
-            raise Exception("UDP listener did not respond within timeout")
+            # If UDP probe fails, try one more time with a slightly longer timeout
+            await asyncio.sleep(0.2)
+            udp_ready = await loop.run_in_executor(None, _probe_udp, addr)
+            if not udp_ready:
+                raise Exception("UDP listener did not respond within timeout")
 
-        # Reset mock upstream counters so the probe does not affect
-        # failure‑count tests or rate‑limiting tests.
+        # Reset mock upstream counters
         for mu in mock_upstreams:
             mu._queries = 0
 
@@ -284,7 +263,6 @@ async def phantomd_server_factory():
             pass
     for mu in mock_upstreams:
         mu.close()
-
 
 def _new_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
