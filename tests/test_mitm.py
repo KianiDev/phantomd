@@ -21,17 +21,17 @@ async def test_mitm_socket_handler():
         )
         resolver.forward_dns_query = AsyncMock(return_value=b"\x00\x01\x02\x03")
 
+        # Explicitly use protocol_factory argument
         server = await asyncio.start_unix_server(
-            lambda: DoHSocketHandler(resolver),
-            socket_path
+            protocol_factory=lambda: DoHSocketHandler(resolver),
+            path=socket_path
         )
         server_task = asyncio.create_task(server.serve_forever())
 
         try:
-            # Wait for the socket to become available
+            # Wait for socket to become available
             await asyncio.sleep(0.1)
 
-            # Use wait_for to enforce a timeout on the connection attempt
             reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(socket_path), timeout=5.0
             )
