@@ -49,6 +49,12 @@ jobs:
         pip install -r requirements.txt
         pip install pytest pytest-asyncio pytest-timeout
 
-    - name: Run tests
+    - name: Run tests sequentially
       run: |
-        pytest tests/ -v
+        set -e
+        for testfile in tests/test_*.py; do
+          echo "========================================="
+          echo "Running $testfile"
+          echo "========================================="
+          pytest "$testfile" -v --timeout=60
+        done
